@@ -1645,26 +1645,26 @@ doc.save('dossier-aides-'+(P.prenom||'waqfia')+'-2026.pdf');
 /* === MOTEUR DE RÈGLES (doit être chargé en premier) === */
 /**
  * MOTEUR_V2.JS — Moteur de règles précis pour Waqf IA
- * Correspond à aides_v2.js — 55 aides, seuils légaux 2024-2025
+ * Correspond à aides_v2.js — 55 aides, seuils légaux 2026
  * Aucune dépendance externe. 100% local. 100% gratuit.
  */
 (function() {
   'use strict';
 
   /* ────────────────────────────────────────────────────────────────
-     SEUILS LÉGAUX BELGES 2024-2025
+     SEUILS LÉGAUX BELGES 2026
   ──────────────────────────────────────────────────────────────── */
   var S = {
     // RIS
-    ris_isole:         1301.05,
-    ris_cohabitant:    867.37,
-    ris_chef_menage:   1301.05,
+    ris_isole:         1340.47,
+    ris_cohabitant:    893.65,
+    ris_chef_menage:   1811.57,
     // GRAPA
-    grapa_isole:       1107.72,
-    grapa_couple:      739.08,
+    grapa_isole:       1611.96,
+    grapa_couple:      1074.64,
     // BIM / OMNIO — revenus BRUTS annuels
-    bim_isole_annuel:  20611,
-    bim_par_enfant:    5151,
+    bim_isole_annuel:  28662.69,
+    bim_par_enfant:    5306.25,
     // Allocation loyer (RBC et Wallonie identiques)
     loyer_1p:  1563,
     loyer_2p:  1940,
@@ -2531,7 +2531,7 @@ doc.save('dossier-aides-'+(P.prenom||'waqfia')+'-2026.pdf');
  * AIDES_V2.JS — Base de données complète des aides sociales belges
  * Version 2 — 55+ aides, montants différenciés par statut, conditions précises
  * Couverture : Fédéral · RBC · Wallonie · FWB · Flandre (partiel)
- * Sources : SPF SS, CPAS.be, INAMI, ONEM, logement.brussels, wallonie.be (2024-2025)
+ * Sources : SPF SS, CPAS.be, INAMI, ONEM, logement.brussels, wallonie.be (2026)
  */
 
 window.AIDES_DB = [
@@ -2546,9 +2546,9 @@ window.AIDES_DB = [
     organisme: "CPAS",
     niveau: "fédéral",
     categorie: "revenu",
-    montant_mensuel_max: 1301,
-    montant_affichage: "1 301,05 €/mois",
-    description: "Droit fondamental à un revenu minimum pour toute personne sans ressources suffisantes vivant seule. Le CPAS complète vos revenus jusqu'au plafond. Renouvelable trimestriellement après enquête sociale.",
+    montant_mensuel_max: 1340.47,
+    montant_affichage: "1 340,47 €/mois",
+    description: "⚠️ Nouveau au 01/03/2026 : le CPAS tient compte des ressources des débiteurs alimentaires majeurs cohabitants. Droit fondamental à un revenu minimum pour toute personne sans ressources suffisantes vivant seule. Le CPAS complète vos revenus jusqu'au plafond. Renouvelable trimestriellement après enquête sociale.",
     conditions: {
       age_min: 18,
       situation_familiale: ["seul"],
@@ -2578,8 +2578,8 @@ window.AIDES_DB = [
     organisme: "CPAS",
     niveau: "fédéral",
     categorie: "revenu",
-    montant_mensuel_max: 868,
-    montant_affichage: "867,37 €/mois",
+    montant_mensuel_max: 893.65,
+    montant_affichage: "893,65 €/mois",
     description: "Revenu d'intégration pour les personnes partageant un logement avec d'autres adultes (cohabitation légale). Montant réduit car les charges sont partagées. Le CPAS évalue la situation réelle du ménage.",
     conditions: {
       age_min: 18,
@@ -2609,8 +2609,8 @@ window.AIDES_DB = [
     organisme: "CPAS",
     niveau: "fédéral",
     categorie: "revenu",
-    montant_mensuel_max: 1301,
-    montant_affichage: "1 301,05 €/mois",
+    montant_mensuel_max: 1811.57,
+    montant_affichage: "1 811,57 €/mois",
     description: "Montant majoré du RIS pour les parents isolés et les personnes avec personne à charge (enfants, conjoint sans revenus). Même montant que l'isolé mais conditions d'accès différentes selon composition du ménage.",
     conditions: {
       age_min: 18,
@@ -2766,8 +2766,8 @@ window.AIDES_DB = [
     niveau: "régional",
     region: "RBC",
     categorie: "famille",
-    montant_mensuel_max: 660,
-    montant_affichage: "165 à 660 €/mois selon rang et âge",
+    montant_mensuel_max: 190,
+    montant_affichage: "190,23 €/mois (base) + suppléments",
     description: "Allocation mensuelle par enfant à charge. Montants 2024 : 1er enfant 165,61€, 2e enfant 307,40€, 3e enfant et + 521,05€. Suppléments pour handicap (+428€), famille monoparentale (+46€), bas revenus (+53€ si revenus < 2 813€/mois). Enfants jusqu'à 18 ans (25 ans si études).",
     conditions: {
       residences: ["RBC"],
@@ -2795,8 +2795,8 @@ window.AIDES_DB = [
     niveau: "régional",
     region: "wallonie",
     categorie: "famille",
-    montant_mensuel_max: 620,
-    montant_affichage: "174 à 617 €/mois selon rang",
+    montant_mensuel_max: 196,
+    montant_affichage: "196,57 €/mois (base) + suppléments",
     description: "Allocation mensuelle par enfant en Wallonie. Montants 2024 : 1er enfant 174,60€, 2e enfant 321,77€, 3e enfant et + 481,47€. Supplément social : +133,61€ si revenus < 2 600€/mois. Supplément handicap : +428€. Forfait annuel d'âge (6, 12, 18 ans). Jusqu'à 25 ans si études.",
     conditions: {
       residences: ["wallonie"],
@@ -2903,7 +2903,7 @@ window.AIDES_DB = [
     region: "RBC",
     categorie: "famille",
     montant_mensuel_max: null,
-    montant_affichage: "1 086,72 € (1er) / 814,12 € (2e+)",
+    montant_affichage: "1 395,02 € (1er) · 634,10 € (2e et +)",
     description: "Prime unique versée à la naissance ou à l'adoption d'un enfant par un parent domicilié à Bruxelles. 1er enfant : 1 086,72€. Du 2e enfant : 814,12€. Doit être réclamée dans les 5 ans suivant la naissance. Aucune condition de revenus.",
     conditions: {
       residences: ["RBC"],
@@ -2930,7 +2930,7 @@ window.AIDES_DB = [
     region: "wallonie",
     categorie: "famille",
     montant_mensuel_max: null,
-    montant_affichage: "1 232,51 € (1er) / 924,38 € (2e+)",
+    montant_affichage: "1 395,02 € (identique à Bruxelles depuis 01/03/2026)",
     description: "Prime unique wallonne plus élevée qu'à Bruxelles. 1er enfant : 1 232,51€. 2e enfant et suivants : 924,38€. Versée dès la naissance ou à l'adoption. Délai de 5 ans pour la demande. Aucune condition de revenus.",
     conditions: {
       residences: ["wallonie"],
@@ -3020,8 +3020,8 @@ window.AIDES_DB = [
     organisme: "Service fédéral des Pensions (SFP)",
     niveau: "fédéral",
     categorie: "pension",
-    montant_mensuel_max: 1107,
-    montant_affichage: "739€ (couple) / 1 107€ (isolé·e)",
+    montant_mensuel_max: 1611.96,
+    montant_affichage: "756€ (couple) / 1 612€ (isolé·e)",
     description: "Complément de pension garanti pour les 65 ans et plus dont les revenus totaux sont insuffisants. Le SFP propose automatiquement ce droit à la pension, mais une demande active est souvent nécessaire. Isolé·e : jusqu'à 1 107,72€/mois. Couple : chacun jusqu'à 739,08€/mois. Prend en compte revenus mobiliers et immobiliers.",
     conditions: {
       age_min: 65,
