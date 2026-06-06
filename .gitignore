@@ -1,0 +1,5 @@
+scraper/node_modules/
+scraper/montants_officiels.json
+scraper/bloc_seuils.js
+.DS_Store
+*.log
