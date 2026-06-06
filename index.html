@@ -1259,22 +1259,22 @@ function animateLoading(){
 }
 
 function showScreen(name){
-  var map={
-    'form':    ['form-section','block'],
-    'loading': ['screen-loading','block'],
-    'results': ['screen-results','block']
-  };
-  // Cacher tout
   ['form-section','screen-loading','screen-results'].forEach(function(id){
-    var el=$id(id);if(el)el.style.display='none';
+    var el=$id(id);if(!el)return;
+    el.style.display=id.includes(name)||id===name?'':'none';
   });
-  // Montrer le bon écran
-  if(name==='form'){
-    var el=$id('form-section');if(el)el.style.display='block';
-  } else if(name==='loading'){
-    var el=$id('screen-loading');if(el)el.style.display='block';
+  if(name==='loading'){
+    $id('form-section').style.display='none';
+    $id('screen-loading').style.display='block';
+    $id('screen-results').style.display='none';
   } else if(name==='results'){
-    var el=$id('screen-results');if(el)el.style.display='block';
+    $id('form-section').style.display='none';
+    $id('screen-loading').style.display='none';
+    $id('screen-results').style.display='block';
+  } else {
+    $id('form-section').style.display='block';
+    $id('screen-loading').style.display='none';
+    $id('screen-results').style.display='none';
   }
   window.scrollTo({top:0,behavior:'smooth'});
 }
@@ -1642,7 +1642,891 @@ doc.save('dossier-aides-'+(P.prenom||'waqfia')+'-2026.pdf');
 </script>
 
 <script>
-/* === AIDES DATABASE === */
+/* === MOTEUR DE RÈGLES (doit être chargé en premier) === */
+/**
+ * MOTEUR_V2.JS — Moteur de règles précis pour Waqf IA
+ * Correspond à aides_v2.js — 55 aides, seuils légaux 2024-2025
+ * Aucune dépendance externe. 100% local. 100% gratuit.
+ */
+(function() {
+  'use strict';
+
+  /* ────────────────────────────────────────────────────────────────
+     SEUILS LÉGAUX BELGES 2024-2025
+  ──────────────────────────────────────────────────────────────── */
+  var S = {
+    // RIS
+    ris_isole:         1301.05,
+    ris_cohabitant:    867.37,
+    ris_chef_menage:   1301.05,
+    // GRAPA
+    grapa_isole:       1107.72,
+    grapa_couple:      739.08,
+    // BIM / OMNIO — revenus BRUTS annuels
+    bim_isole_annuel:  20611,
+    bim_par_enfant:    5151,
+    // Allocation loyer (RBC et Wallonie identiques)
+    loyer_1p:  1563,
+    loyer_2p:  1940,
+    loyer_3p:  2375,
+    // Allocation monoparentale
+    monop_revenu_max:  1852,
+    // Supplément social wallon
+    supp_wall_revenu_max: 2600,
+    // Allocations familiales — supplément BIM-like
+    af_supplement_revenu_max: 2813,
+    // Bourse d'études FWB
+    bourse_annuel_max: 31015,
+    // Tarif social télécom
+    telecom_revenu_max: 1800,
+    // Fonds mazout
+    mazout_isole: 1943,
+    mazout_couple: 2589,
+    mazout_par_pers: 175,
+    // Aide juridique gratuite
+    aide_juridique_gratuit: 1500,
+    aide_juridique_partiel: 1800,
+    // MAF
+    maf_1: 20260 / 12,
+    maf_2: 34412 / 12,
+    maf_3: 48561 / 12,
+  };
+
+  /* ────────────────────────────────────────────────────────────────
+     UTILITAIRES
+  ──────────────────────────────────────────────────────────────── */
+
+  function rev(p) {
+    var principal = parseFloat(p.revenus_nets) || 0;
+    var autresStr = p.autres_revenus || '';
+    var m = autresStr.match(/(\d[\d ,.]*)\s*(?:€|eur)/i);
+    var autres = m ? parseFloat(m[1].replace(/[\s]/g, '').replace(',', '.')) : 0;
+    return principal + autres;
+  }
+
+  function age(p) { return parseInt(p.age) || 0; }
+  function enfants(p) { return parseInt(p.nb_enfants) || 0; }
+  function loyer(p) { return parseFloat(p.loyer) || 0; }
+
+  function has(p, val) {
+    return Array.isArray(p.situation_speciale) && p.situation_speciale.indexOf(val) !== -1;
+  }
+
+  function seuilLoyer(p) {
+    if (p.situation_familiale === 'seul') return S.loyer_1p;
+    if (enfants(p) >= 1) return S.loyer_3p;
+    return S.loyer_2p;
+  }
+
+  function bimMensuel(p) {
+    var base = S.bim_isole_annuel;
+    var pers = p.situation_familiale === 'marie' || p.situation_familiale === 'cohabitant' ? 1 : 0;
+    pers += enfants(p);
+    return (base + pers * S.bim_par_enfant) / 12;
+  }
+
+  function isBenefActuel(p) {
+    // Bénéficie déjà d'une allocation sociale majeure
+    return has(p, 'beneficiaire_ris')
+      || p.situation_pro === 'incapacite'
+      || has(p, 'handicap');
+  }
+
+  function ok(eligible, score, pos, neg, montant, note) {
+    return { eligible: eligible, score: score, motifs_positifs: pos, motifs_negatifs: neg, montant_estime: montant || null, note_specifique: note || null };
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+     RÈGLES PAR AIDE — une fonction par id d'aide
+  ──────────────────────────────────────────────────────────────── */
+  var R = {};
+
+  // ── RIS isolé
+  R.ris_isole = function(p) {
+    var r = rev(p), a = age(p), pos = [], neg = [];
+    if (a < 18) return ok(false, 0, pos, ['Âge minimum 18 ans'], 0);
+    pos.push('Âge ≥ 18 ans');
+    if (p.situation_familiale !== 'seul') return ok(false, 0, pos, ['Statut isolé·e requis — voir RIS chef de ménage ou cohabitant'], 0);
+    pos.push('Statut isolé confirmé');
+    if (!['belge','UE','réfugié'].includes(p.nationalite)) neg.push('Nationalité à vérifier avec le CPAS');
+    var plafond = S.ris_isole;
+    var complement = Math.max(0, plafond - r);
+    var score = 20;
+    if (r === 0) { pos.push('Aucun revenu — RIS maximal probable'); score += 65; }
+    else if (r < plafond * 0.5) { pos.push('Revenus (' + r + '€) bien inférieurs au plafond (' + Math.round(plafond) + '€)'); score += 50; }
+    else if (r < plafond) { pos.push('Revenus (' + r + '€) inférieurs au plafond RIS'); score += 30; }
+    else { neg.push('Revenus (' + r + '€) dépassent le plafond RIS (' + Math.round(plafond) + '€)'); return ok(false, 10, pos, neg, 0); }
+    if (['sans_emploi','etudiant','incapacite','autre'].includes(p.situation_pro)) { pos.push('Situation professionnelle compatible'); score += 10; }
+    return ok(true, Math.min(100, score), pos, neg, Math.round(complement),
+      complement < 100 ? 'Complément estimé faible — le CPAS peut proposer des aides en nature complémentaires' : null);
+  };
+
+  // ── RIS cohabitant
+  R.ris_cohabitant = function(p) {
+    var r = rev(p), a = age(p), pos = [], neg = [];
+    if (a < 18) return ok(false, 0, pos, ['Âge minimum 18 ans'], 0);
+    if (p.situation_familiale !== 'cohabitant') return ok(false, 0, pos, ['Statut cohabitant requis'], 0);
+    pos.push('Statut cohabitant confirmé');
+    var plafond = S.ris_cohabitant;
+    var complement = Math.max(0, plafond - r);
+    var score = 20;
+    if (r < plafond * 0.5) { pos.push('Revenus bien inférieurs au plafond cohabitant (' + Math.round(plafond) + '€)'); score += 55; }
+    else if (r < plafond) { pos.push('Revenus (' + r + '€) sous le plafond'); score += 30; }
+    else { neg.push('Revenus (' + r + '€) dépassent le plafond cohabitant (' + Math.round(plafond) + '€)'); return ok(false, 5, pos, neg, 0); }
+    neg.push('Le CPAS vérifie les revenus de TOUS les cohabitants — montant peut être revu');
+    return ok(true, Math.min(100, score), pos, neg, Math.round(complement));
+  };
+
+  // ── RIS chef de ménage
+  R.ris_chef_menage = function(p) {
+    var r = rev(p), a = age(p), pos = [], neg = [];
+    if (a < 18) return ok(false, 0, pos, ['Âge minimum 18 ans'], 0);
+    var sitOk = p.situation_familiale === 'monoparental' || p.situation_familiale === 'marie';
+    if (!sitOk) return ok(false, 0, pos, ['Réservé aux parents isolés et chefs de ménage avec personne à charge'], 0);
+    if (p.situation_familiale === 'monoparental') { pos.push('Parent isolé — statut chef de ménage'); }
+    else { pos.push('Chef de ménage avec personne à charge'); }
+    var plafond = S.ris_chef_menage;
+    var complement = Math.max(0, plafond - r);
+    var score = 25;
+    if (r === 0) { pos.push('Aucun revenu — aide maximale'); score += 60; }
+    else if (r < plafond * 0.5) { pos.push('Revenus (' + r + '€) très inférieurs au plafond (' + Math.round(plafond) + '€)'); score += 50; }
+    else if (r < plafond) { pos.push('Revenus sous le plafond RIS chef de ménage'); score += 30; }
+    else { neg.push('Revenus (' + r + '€) dépassent le plafond (' + Math.round(plafond) + '€)'); return ok(false, 10, pos, neg, 0); }
+    if (enfants(p) > 0) { pos.push(enfants(p) + ' enfant(s) à charge — droits renforcés'); score += 5; }
+    return ok(true, Math.min(100, score), pos, neg, Math.round(complement));
+  };
+
+  // ── Allocation chômage
+  R.allocation_chomage = function(p) {
+    var r = rev(p), a = age(p), pos = [], neg = [];
+    if (p.situation_pro !== 'sans_emploi') return ok(false, 0, pos, ['Réservé aux personnes sans emploi involontairement'], 0);
+    if (a < 18 || a > 65) { neg.push('Âge hors tranche 18-65'); return ok(false, 10, pos, neg, 0); }
+    pos.push('Situation de chômage — condition principale');
+    pos.push('Contactez immédiatement un syndicat (FGTB, CSC, CGSLB) ou la CAPAC pour déposer le C4');
+    var score = 50;
+    if (r === 0) { pos.push('Aucun revenu déclaré — probablement en attente de paiement'); score += 20; }
+    neg.push('Requiert un historique de travail (180 jours dans les 18 mois ou 312 jours dans les 27 mois selon âge)');
+    var taux = (p.situation_familiale === 'seul' || p.situation_familiale === 'monoparental') ? 0.65 : 0.60;
+    var estim = r > 0 ? Math.min(Math.round(r * taux), 1783) : 1100;
+    return ok(true, Math.min(100, score), pos, neg, estim,
+      'Montant calculé par l\'ONEM sur base du salaire brut précédent. Dépôt urgent requis.');
+  };
+
+  // ── Indemnité incapacité
+  R.indemnite_incapacite = function(p) {
+    var pos = [], neg = [];
+    if (p.situation_pro !== 'incapacite' && !has(p, 'maladie_chronique')) {
+      return ok(false, 0, pos, ['Réservé aux personnes en incapacité de travail reconnue'], 0);
+    }
+    pos.push('Situation d\'incapacité de travail ou maladie chronique signalée');
+    pos.push('Reconnaissance par le médecin-conseil de votre mutualité obligatoire');
+    var score = 55;
+    var r = rev(p);
+    var estim = r > 0 ? Math.round(r * 0.60) : 1200;
+    if (has(p, 'maladie_chronique')) { pos.push('Maladie chronique — droits potentiels longue durée'); score += 15; }
+    neg.push('Délai de carence : 1 jour (salariés). Notification mutualité dans les 48h obligatoire.');
+    return ok(true, Math.min(100, score), pos, neg, estim);
+  };
+
+  // ── Accident travail
+  R.accident_travail = function(p) {
+    var pos = [], neg = [];
+    if (p.situation_pro !== 'incapacite') return ok(false, 0, pos, ['Réservé aux accidents du travail / maladies professionnelles'], 0);
+    pos.push('Incapacité de travail signalée — vérifier si origine professionnelle');
+    neg.push('Applicable uniquement si l\'incapacité est due à un accident du travail ou trajet');
+    neg.push('Déclaration de l\'accident à faire par l\'employeur dans les 8 jours');
+    return ok(true, 40, pos, neg, null, 'À vérifier selon l\'origine de l\'incapacité');
+  };
+
+  // ── Prime embauche Activa
+  R.prime_embauche_activa = function(p) {
+    var pos = [], neg = [];
+    if (p.situation_pro !== 'sans_emploi') return ok(false, 0, pos, ['Réservé aux chercheurs d\'emploi'], 0);
+    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, pos, ['ACTIRIS (BXL) et FOREm (Wallonie) uniquement'], 0);
+    pos.push('Chercheur d\'emploi en région francophone — éligible ACTIRIS/FOREm');
+    pos.push('La prime facilite votre embauche : l\'employeur reçoit jusqu\'à 800€/mois de réduction');
+    var score = 55;
+    var a = age(p);
+    if (a < 26) { pos.push('Jeune ≤ 25 ans — programmes prioritaires et délai réduit (3 mois)'); score += 20; }
+    if (a > 50) { pos.push('50+ : programme spécifique Activa seniors'); score += 15; }
+    neg.push('Nécessite inscription préalable comme DE (demandeur d\'emploi) depuis ≥ 6 mois');
+    return ok(true, Math.min(100, score), pos, neg, 0);
+  };
+
+  // ── Allocations familiales RBC
+  R.allocations_familiales_rbc = function(p) {
+    if (p.region !== 'RBC') return ok(false, 0, [], ['Iriscare — Bruxelles-Capitale uniquement'], 0);
+    if (enfants(p) < 1) return ok(false, 0, [], ['Au moins 1 enfant à charge requis'], 0);
+    var pos = [], neg = [];
+    pos.push('Bruxelles + enfant(s) à charge — droit universel sans condition de revenus');
+    var montantBase = enfants(p) === 1 ? 165 : enfants(p) === 2 ? 307 : 521;
+    var score = 90;
+    var r = rev(p);
+    if (r < S.af_supplement_revenu_max) { pos.push('Revenus < 2 813€/mois — supplément social +53€/enfant probable'); score = 95; }
+    if (p.situation_familiale === 'monoparental') { pos.push('Famille monoparentale — supplément +46€/enfant automatique'); }
+    pos.push('Montant de base : ' + montantBase + '€/mois (1er enfant 165€, 2e 307€, 3e+ 521€)');
+    return ok(true, Math.min(100, score), pos, neg, montantBase + enfants(p) * 46);
+  };
+
+  // ── Allocations familiales Wallonie
+  R.allocations_familiales_wallonie = function(p) {
+    if (p.region !== 'wallonie') return ok(false, 0, [], ['Famiwal — Wallonie uniquement'], 0);
+    if (enfants(p) < 1) return ok(false, 0, [], ['Au moins 1 enfant à charge requis'], 0);
+    var pos = [], neg = [];
+    pos.push('Wallonie + enfant(s) — droit universel');
+    var montantBase = enfants(p) === 1 ? 174 : enfants(p) === 2 ? 321 : 481;
+    var score = 90;
+    var r = rev(p);
+    if (r < S.supp_wall_revenu_max) { pos.push('Revenus < 2 600€/mois — supplément social +133€/mois éligible'); score = 95; }
+    pos.push('Montant de base : ' + montantBase + '€/mois');
+    return ok(true, Math.min(100, score), pos, neg, montantBase + (r < S.supp_wall_revenu_max ? 133 : 0));
+  };
+
+  // ── Supplément monoparental RBC
+  R.supplement_monoparental_rbc = function(p) {
+    if (p.region !== 'RBC') return ok(false, 0, [], ['Iriscare — Bruxelles uniquement'], 0);
+    if (p.situation_familiale !== 'monoparental') return ok(false, 0, [], ['Réservé aux parents isolés'], 0);
+    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) requis'], 0);
+    return ok(true, 95, ['Bruxelles + parent isolé + enfant(s) — automatique avec AF'], [],
+      46 * enfants(p), 'S\'ajoute automatiquement aux allocations familiales Iriscare');
+  };
+
+  // ── Supplément social Wallonie
+  R.supplement_monoparental_wall = function(p) {
+    if (p.region !== 'wallonie') return ok(false, 0, [], ['Famiwal — Wallonie uniquement'], 0);
+    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) requis'], 0);
+    var r = rev(p);
+    var pos = [], neg = [];
+    if (r < S.supp_wall_revenu_max) {
+      pos.push('Revenus (' + r + '€) inférieurs au seuil wallon (2 600€) — supplément applicable');
+      return ok(true, 90, pos, neg, 133 * Math.min(enfants(p), 3));
+    }
+    neg.push('Revenus (' + r + '€) au-dessus du seuil 2 600€/mois');
+    return ok(false, 10, pos, neg, 0);
+  };
+
+  // ── Allocation monoparentale fédérale
+  R.allocation_monoparentale = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    if (p.situation_familiale !== 'monoparental') return ok(false, 0, pos, ['Réservé aux parents isolés'], 0);
+    if (enfants(p) < 1) return ok(false, 0, pos, ['Enfant(s) à charge requis'], 0);
+    pos.push('Parent isolé + enfant(s) — conditions de base remplies');
+    var score = 30;
+    if (r < S.monop_revenu_max * 0.7) { pos.push('Revenus faibles — éligibilité forte'); score += 55; }
+    else if (r < S.monop_revenu_max) { pos.push('Revenus (' + r + '€) sous le plafond (' + S.monop_revenu_max + '€)'); score += 35; }
+    else { neg.push('Revenus (' + r + '€) dépassent le plafond (' + S.monop_revenu_max + '€)'); return ok(false, 10, pos, neg, 0); }
+    return ok(true, Math.min(100, score), pos, neg, 192);
+  };
+
+  // ── Prime naissance RBC
+  R.prime_naissance_rbc = function(p) {
+    if (p.region !== 'RBC') return ok(false, 0, [], ['Iriscare — Bruxelles uniquement'], 0);
+    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) requis'], 0);
+    var montant = enfants(p) === 1 ? 1086 : 814;
+    return ok(true, 90, ['Bruxelles + enfant(s) — droit universel sans condition de revenus'], [],
+      null, 'Prime unique de ' + montant + '€ par enfant (1 086€ pour le 1er, 814€ ensuite)');
+  };
+
+  // ── Prime naissance Wallonie
+  R.prime_naissance_wallonie = function(p) {
+    if (p.region !== 'wallonie') return ok(false, 0, [], ['Famiwal — Wallonie uniquement'], 0);
+    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) requis'], 0);
+    var montant = enfants(p) === 1 ? 1232 : 924;
+    return ok(true, 90, ['Wallonie + enfant(s) — droit universel'], [],
+      null, 'Prime unique de ' + montant + '€ (1 232€ pour le 1er, 924€ ensuite)');
+  };
+
+  // ── Allocation handicap
+  R.allocation_handicap = function(p) {
+    var a = age(p), r = rev(p), pos = [], neg = [];
+    if (!has(p, 'handicap') && !has(p, 'maladie_chronique')) {
+      return ok(false, 0, pos, ['Requiert un handicap reconnu ou en cours de reconnaissance'], 0);
+    }
+    pos.push('Handicap / maladie chronique signalé(e)');
+    if (a < 21) { neg.push('Âge minimum 21 ans (en dessous → allocation enfant handicapé)'); return ok(false, 15, pos, neg, 0); }
+    if (a > 65) { neg.push('Après 65 ans → APA (allocation aide personnes âgées) à la place'); return ok(false, 15, pos, neg, 0); }
+    pos.push('Âge conforme (21-65 ans)');
+    var score = 40;
+    if (r < 1200) { pos.push('Revenus faibles — catégorie supérieure probable'); score += 35; }
+    else if (r < 2200) { pos.push('Revenus dans les seuils admissibles'); score += 20; }
+    else { neg.push('Revenus proches ou au-delà du plafond — à vérifier selon composition ménage'); }
+    neg.push('Évaluation médicale obligatoire par le SPF — 3 à 6 mois de procédure');
+    return ok(true, Math.min(100, score), pos, neg, 476, 'Catégorie 3 par défaut — montant définitif selon évaluation médicale (110 à 918€/mois)');
+  };
+
+  // ── APA seniors
+  R.allocation_aide_agees = function(p) {
+    var a = age(p), pos = [], neg = [];
+    if (a < 65) return ok(false, 0, pos, ['Réservé aux 65 ans et plus'], 0);
+    if (!has(p, 'handicap') && !has(p, 'maladie_chronique') && p.situation_pro !== 'incapacite') {
+      neg.push('Requiert une perte d\'autonomie reconnue (maladie, handicap, dépendance)');
+      return ok(false, 20, pos, neg, 0);
+    }
+    pos.push('65+ avec perte d\'autonomie signalée — APA potentiellement éligible');
+    var r = rev(p);
+    var score = 50;
+    if (r < 1500) { pos.push('Revenus faibles — allocations complémentaires maximales possibles'); score += 30; }
+    neg.push('Évaluation médicale par le SPF obligatoire (3-6 mois)');
+    return ok(true, Math.min(100, score), pos, neg, 476);
+  };
+
+  // ── GRAPA
+  R.grapa = function(p) {
+    var a = age(p), r = rev(p), pos = [], neg = [];
+    if (a < 65) return ok(false, 0, pos, ['Réservé aux 65 ans et plus'], 0);
+    pos.push('Âge ≥ 65 ans');
+    var plafond = (p.situation_familiale === 'marie' || p.situation_familiale === 'cohabitant') ? S.grapa_couple : S.grapa_isole;
+    var complement = Math.max(0, plafond - r);
+    var score = 40;
+    if (r < plafond * 0.5) { pos.push('Pension très insuffisante — GRAPA quasi certaine'); score += 50; }
+    else if (r < plafond) { pos.push('Revenus (' + r + '€) inférieurs au plafond GRAPA (' + Math.round(plafond) + '€)'); score += 35; }
+    else { neg.push('Revenus (' + r + '€) dépassent le plafond GRAPA — non éligible'); return ok(false, 5, pos, neg, 0); }
+    if (p.situation_pro === 'pension') { pos.push('Statut pensionné — SFP propose souvent automatiquement'); score += 5; }
+    return ok(true, Math.min(100, score), pos, neg, Math.round(complement), 'Le SFP peut proposer automatiquement — vérifiez sur mypension.be');
+  };
+
+  // ── BIM
+  R.bim = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    var seuil = bimMensuel(p);
+    var auto = has(p, 'beneficiaire_ris') || p.situation_pro === 'incapacite' || has(p, 'handicap') || parseInt(p.age) >= 65 || p.situation_pro === 'sans_emploi';
+    var score = 15;
+    if (auto) { pos.push('Accordé automatiquement selon statut — à signaler à votre mutualité'); score += 65; }
+    if (r * 12 < S.bim_isole_annuel + enfants(p) * S.bim_par_enfant) {
+      pos.push('Revenus annuels (' + Math.round(r * 12) + '€) inférieurs au seuil BIM');
+      score += 35;
+    } else if (r < seuil * 1.1) {
+      pos.push('Revenus proches du seuil — à vérifier auprès de la mutualité');
+      score += 15;
+    } else {
+      neg.push('Revenus possiblement au-dessus du seuil BIM — vérifiez avec la mutualité');
+    }
+    if (enfants(p) > 0) { pos.push(enfants(p) + ' enfant(s) — seuil BIM augmenté de ' + (enfants(p) * S.bim_par_enfant) + '€/an'); score += 10; }
+    if (p.situation_familiale === 'monoparental') { pos.push('Famille monoparentale — seuil majoré'); score += 5; }
+    return ok(auto || r * 12 < S.bim_isole_annuel + enfants(p) * S.bim_par_enfant + 5000, Math.min(100, score), pos, neg, 80);
+  };
+
+  // ── OMNIO
+  R.omnio = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    var seuilMens = (S.bim_isole_annuel + enfants(p) * S.bim_par_enfant) / 12;
+    if (isBenefActuel(p)) {
+      return ok(false, 0, pos, ['BIM automatique applicable — OMNIO est la voie revenus pour non-bénéficiaires d\'allocation'], 0);
+    }
+    if (r < seuilMens) {
+      pos.push('Revenus sous le seuil OMNIO — demande active à faire auprès de la mutualité');
+      pos.push('Mêmes avantages que le BIM — valable 1 an renouvelable');
+      return ok(true, 75, pos, neg, 70);
+    }
+    neg.push('Revenus (' + Math.round(r) + '€) probablement au-delà du seuil mensuel (' + Math.round(seuilMens) + '€)');
+    return ok(false, 10, pos, neg, 0);
+  };
+
+  // ── Tarif social énergie
+  R.tarif_social_energie = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    var auto = has(p, 'beneficiaire_ris') || p.situation_pro === 'incapacite' || has(p, 'handicap') || parseInt(p.age) >= 65;
+    var score = 10;
+    if (auto) { pos.push('Accordé automatiquement — vérifiez que votre fournisseur l\'applique'); score += 70; }
+    if (r < 1200) { pos.push('Revenus très bas — tarif social quasi certain'); score += 40; }
+    else if (r < 1600) { pos.push('Revenus modestes — probablement éligible'); score += 25; }
+    else if (r < 1943) { pos.push('Revenus dans la fourchette éligible'); score += 15; }
+    else { neg.push('Revenus (' + r + '€) possiblement trop élevés — à vérifier'); }
+    if (!auto && r >= 1943) return ok(false, 10, pos, neg, 0);
+    return ok(true, Math.min(100, score), pos, neg, 65);
+  };
+
+  // ── Prime énergie Wallonie
+  R.prime_energie_wallonie = function(p) {
+    if (p.region !== 'wallonie') return ok(false, 0, [], ['Réservé à la Wallonie'], 0);
+    var r = rev(p), pos = [], neg = [];
+    pos.push('Région wallonne — primes RENOWATT et programme MEBAR disponibles');
+    var score = 20;
+    if (['proprietaire','locataire_prive','locataire_social'].includes(p.logement)) {
+      pos.push('Statut de logement compatible'); score += 20;
+    } else if (p.logement === 'heberge') {
+      neg.push('Hébergé — accord du logeur nécessaire pour travaux');
+    }
+    var plaf = enfants(p) > 0 || p.situation_familiale !== 'seul' ? 2600 : 2000;
+    if (r < plaf * 0.7) { pos.push('Revenus faibles — taux majoré MEBAR applicable (aide urgente possible)'); score += 40; }
+    else if (r < plaf) { pos.push('Revenus dans la tranche standard'); score += 20; }
+    else { neg.push('Revenus (' + r + '€) au-dessus du plafond MEBAR — primes RENOWATT standard applicables'); score += 10; }
+    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Urgence énergétique — programme MEBAR chauffage prioritaire'); score += 15; }
+    return ok(true, Math.min(100, score), pos, neg, null);
+  };
+
+  // ── Prime énergie RBC
+  R.prime_energie_rbc = function(p) {
+    if (p.region !== 'RBC') return ok(false, 0, [], ['RENOLUTION — Bruxelles uniquement'], 0);
+    var r = rev(p), pos = [], neg = [];
+    if (!['proprietaire','locataire_prive'].includes(p.logement)) {
+      neg.push('Requiert d\'être propriétaire ou locataire avec accord du propriétaire');
+      return ok(false, 10, pos, neg, 0);
+    }
+    pos.push('Bruxelles + statut logement compatible — RENOLUTION disponible');
+    var score = 30;
+    if (r * 12 < 35285) { pos.push('Catégorie 1 (revenus < 35 285€/an) — taux 50-70% des travaux'); score += 40; }
+    else if (r * 12 < 60490) { pos.push('Catégorie 2 — taux 30-50% des travaux'); score += 25; }
+    else { pos.push('Catégorie 3 — taux 15-30% des travaux'); score += 10; }
+    return ok(true, Math.min(100, score), pos, neg, null);
+  };
+
+  // ── Fonds mazout
+  R.fonds_mazout = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    var plaf = p.situation_familiale === 'seul' ? S.mazout_isole : S.mazout_couple + enfants(p) * S.mazout_par_pers;
+    var auto = isBenefActuel(p) || parseInt(p.age) >= 65;
+    if (!auto && r >= plaf) return ok(false, 0, pos, ['Revenus (' + r + '€) supérieurs au plafond (' + Math.round(plaf) + '€) — non éligible'], 0);
+    if (auto) pos.push('Bénéficiaire allocation sociale — réduction automatique sur présentation d\'attestation');
+    else pos.push('Revenus (' + r + '€) sous le plafond mazout (' + Math.round(plaf) + '€)');
+    neg.push('Uniquement pour les logements chauffés au mazout ou propane');
+    return ok(true, auto ? 85 : 70, pos, neg, null);
+  };
+
+  // ── Avance loyer CPAS
+  R.avance_loyer_cpas = function(p) {
+    var pos = [], neg = [];
+    if (!has(p, 'difficulte_financiere_urgente') && loyer(p) === 0) {
+      return ok(false, 20, pos, ['Cette aide cible les locataires en difficulté urgente'], 0);
+    }
+    pos.push('Aide urgente CPAS disponible pour locataires en difficulté');
+    var score = 30;
+    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Situation d\'urgence financière déclarée — priorité CPAS'); score += 50; }
+    if (['locataire_prive','locataire_social'].includes(p.logement)) { pos.push('Locataire — avance sur loyer ou garantie locative éligible'); score += 20; }
+    if (p.logement === 'sans_domicile') { pos.push('Sans domicile fixe — orientation CPAS urgente vers logement'); score += 30; }
+    var loy = loyer(p);
+    return ok(true, Math.min(100, score), pos, neg, loy > 0 ? Math.min(loy * 2, 1600) : 800,
+      'La garantie locative CPAS (2 mois de loyer) est un prêt sans intérêt remboursable progressivement');
+  };
+
+  // ── Allocation loyer RBC
+  R.allocation_loyer_rbc = function(p) {
+    if (p.region !== 'RBC') return ok(false, 0, [], ['Bruxelles-Capitale uniquement'], 0);
+    var r = rev(p), pos = [], neg = [];
+    if (p.logement !== 'locataire_prive') return ok(false, 0, pos, ['Réservé aux locataires du secteur privé bruxellois'], 0);
+    pos.push('Bruxelles + locataire privé');
+    var seuil = seuilLoyer(p);
+    var score = 20;
+    if (!has(p, 'liste_logement_social')) {
+      neg.push('CONDITION CLÉ : inscription sur liste d\'attente logement social bruxellois depuis ≥ 1 an requise');
+      score -= 15;
+    } else {
+      pos.push('Inscription liste logement social confirmée — condition principale remplie'); score += 30;
+    }
+    if (loyer(p) > 0 && loyer(p) <= 1050) { pos.push('Loyer (' + loyer(p) + '€) dans la limite autorisée (1 050€)'); score += 15; }
+    else if (loyer(p) > 1050) { neg.push('Loyer (' + loyer(p) + '€) dépasse le plafond de 1 050€/mois'); }
+    if (r < seuil * 0.6) { pos.push('Revenus très faibles — montant max 240€/mois probable'); score += 40; }
+    else if (r < seuil) { pos.push('Revenus (' + r + '€) sous le plafond (' + Math.round(seuil) + '€)'); score += 25; }
+    else { neg.push('Revenus (' + r + '€) dépassent le plafond (' + Math.round(seuil) + '€)'); return ok(false, 10, pos, neg, 0); }
+    var montant = r < seuil * 0.4 ? 240 : r < seuil * 0.65 ? 160 : 80;
+    return ok(true, Math.min(100, score), pos, neg, montant);
+  };
+
+  // ── Loyer wallon
+  R.loyer_wallon = function(p) {
+    if (p.region !== 'wallonie') return ok(false, 0, [], ['Wallonie uniquement'], 0);
+    var r = rev(p), pos = [], neg = [];
+    if (p.logement !== 'locataire_prive') return ok(false, 0, pos, ['Réservé aux locataires du secteur privé wallon'], 0);
+    pos.push('Wallonie + locataire privé');
+    var seuil = seuilLoyer(p);
+    var score = 20;
+    if (!has(p, 'liste_logement_social')) {
+      neg.push('CONDITION CLÉ : inscription liste logement social wallon depuis ≥ 1 an obligatoire');
+      score -= 10;
+    } else {
+      pos.push('Inscription liste logement social wallon — condition principale'); score += 35;
+    }
+    if (loyer(p) > 0 && loyer(p) <= 900) { pos.push('Loyer (' + loyer(p) + '€) dans la limite wallonne (900€)'); score += 15; }
+    else if (loyer(p) > 900) { neg.push('Loyer (' + loyer(p) + '€) dépasse le plafond wallon (900€)'); }
+    if (r < seuil * 0.6) { pos.push('Revenus très faibles — montant max 192€/mois probable'); score += 40; }
+    else if (r < seuil) { pos.push('Revenus (' + r + '€) sous le plafond (' + Math.round(seuil) + '€)'); score += 25; }
+    else { neg.push('Revenus (' + r + '€) dépassent le plafond (' + Math.round(seuil) + '€)'); return ok(false, 10, pos, neg, 0); }
+    var montant = r < seuil * 0.4 ? 192 : 100;
+    return ok(true, Math.min(100, score), pos, neg, montant);
+  };
+
+  // ── Prime rénovation RBC
+  R.prime_renovation_rbc = function(p) {
+    if (p.region !== 'RBC') return ok(false, 0, [], ['Bruxelles uniquement'], 0);
+    if (p.logement !== 'proprietaire') return ok(false, 0, [], ['Réservé aux propriétaires bruxellois'], 0);
+    var r = rev(p), pos = [], neg = [];
+    pos.push('Propriétaire bruxellois — RENOLUTION applicable');
+    var score = 30;
+    if (r * 12 < 35285) { pos.push('Cat. 1 (< 35 285€/an) — remboursement 50-70%'); score += 50; }
+    else if (r * 12 < 60490) { pos.push('Cat. 2 — remboursement 30-50%'); score += 30; }
+    else { pos.push('Cat. 3 — remboursement 15-30%'); score += 15; }
+    return ok(true, Math.min(100, score), pos, neg, null);
+  };
+
+  // ── Logement social inscription
+  R.logement_social_inscription = function(p) {
+    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, [], ['RBC et Wallonie uniquement'], 0);
+    var r = rev(p), pos = [], neg = [];
+    var plafAnnuel = p.situation_familiale === 'seul' ? 23462 : 28154 + enfants(p) * 3385;
+    if (r * 12 < plafAnnuel) {
+      pos.push('Revenus (' + Math.round(r * 12) + '€/an) sous le plafond (' + Math.round(plafAnnuel) + '€/an)');
+      pos.push('Inscription immédiate recommandée — ouvre droit à l\'allocation loyer après 1 an');
+      return ok(true, 85, pos, neg, null, 'L\'inscription est gratuite et immédiate. Elle ouvre des droits importants dès 1 an sur liste.');
+    }
+    neg.push('Revenus (' + Math.round(r * 12) + '€/an) au-dessus du plafond d\'admission');
+    return ok(false, 10, pos, neg, null);
+  };
+
+  // ── Bourse d'études FWB
+  R.bourse_etudes_fwb = function(p) {
+    var a = age(p), r = rev(p), pos = [], neg = [];
+    if (!has(p, 'etudiant_superieur') && p.situation_pro !== 'etudiant') {
+      return ok(false, 0, pos, ['Réservé aux étudiants de l\'enseignement supérieur FWB'], 0);
+    }
+    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, pos, ['FWB — Bruxelles et Wallonie uniquement'], 0);
+    pos.push('Étudiant du supérieur en FWB — condition principale remplie');
+    var score = 40;
+    if (a > 35) { neg.push('Limite d\'âge généralement 35 ans sauf exceptions'); score -= 10; }
+    if (r < 900) { pos.push('Revenus propres faibles — bourse probable'); score += 35; }
+    else { pos.push('Revenus parentaux déterminants — à vérifier avec le simulateur FWB'); score += 15; }
+    neg.push('Le calcul final dépend des revenus de référence parentaux — simulateur sur allocations-etudes.cfwb.be');
+    return ok(true, Math.min(100, score), pos, neg, 200);
+  };
+
+  // ── Chèques formation
+  R.cheques_formation = function(p) {
+    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, [], ['Wallonie et Bruxelles uniquement'], 0);
+    var pos = [], neg = [];
+    if (p.situation_pro === 'sans_emploi' && p.region === 'RBC') {
+      pos.push('Formations gratuites via Bruxelles Formation pour chercheurs d\'emploi');
+      return ok(true, 85, pos, neg, null, 'À Bruxelles : formations gratuites langues, informatique, métiers via Bruxelles Formation après inscription ACTIRIS');
+    }
+    if (['employe','independant'].includes(p.situation_pro) && p.region === 'wallonie') {
+      pos.push('Salarié/indépendant wallon — chèques-formation disponibles (15€ le chèque de 30€)');
+      return ok(true, 85, pos, neg, null);
+    }
+    neg.push('Chèques-formation Wallonie : réservés aux salariés et indépendants');
+    return ok(false, 20, pos, neg, null);
+  };
+
+  // ── Aide matériel scolaire
+  R.aide_materiel_scolaire = function(p) {
+    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, [], ['RBC et Wallonie uniquement'], 0);
+    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) en âge scolaire requis'], 0);
+    var r = rev(p), pos = [], neg = [];
+    pos.push(enfants(p) + ' enfant(s) + région FWB — conditions de base remplies');
+    var score = 25;
+    if (r < 1200) { pos.push('Revenus faibles — aide scolaire prioritaire'); score += 50; }
+    else if (r < 2200) { pos.push('Revenus dans la fourchette éligible (< 2 200€/mois)'); score += 30; }
+    else { neg.push('Revenus (' + r + '€) possiblement au-dessus du seuil communal'); }
+    return ok(r < 2200, Math.min(100, score), pos, neg, null, 'Montants variables : 50-400€/enfant selon commune et CPAS. Demande en août.');
+  };
+
+  // ── Médiation dettes
+  R.mediation_dettes = function(p) {
+    if (!has(p, 'situation_dette')) return ok(false, 0, [], ['Réservé aux personnes en situation de surendettement'], 0);
+    var pos = [], neg = [];
+    pos.push('Situation d\'endettement déclarée — service GRATUIT disponible');
+    pos.push('Le médiateur stoppe les poursuites et négocie avec les créanciers');
+    var score = 80;
+    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Urgence financière — procédure prioritaire'); score = 95; }
+    pos.push('RCD (Règlement Collectif de Dettes) possible : plan sur 5 ans, remises partielles');
+    return ok(true, Math.min(100, score), pos, neg, null);
+  };
+
+  // ── Aide urgence CPAS
+  R.aide_urgence_cpas = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    var score = 20;
+    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Difficulté financière urgente déclarée — priorité CPAS 24-48h'); score += 60; }
+    if (r < 800) { pos.push('Revenus très faibles — aide CPAS urgente probable'); score += 30; }
+    else if (r < 1300) { pos.push('Revenus faibles — aide ponctuelle CPAS envisageable'); score += 15; }
+    pos.push('Le CPAS peut aider en nature : chèques alimentation, paiement facture, bon pharmacie');
+    return ok(has(p, 'difficulte_financiere_urgente') || r < 1300, Math.min(100, score), pos, neg,
+      r < 500 ? 600 : 300);
+  };
+
+  // ── Aide alimentaire
+  R.aide_alimentaire = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    var plaf = p.situation_familiale === 'seul' ? 1300 : 1700 + enfants(p) * 250;
+    var score = 0;
+    if (r < plaf * 0.6) { pos.push('Revenus très faibles — aide alimentaire prioritaire'); score += 70; }
+    else if (r < plaf) { pos.push('Revenus dans la fourchette éligible'); score += 40; }
+    else { neg.push('Revenus (' + r + '€) probablement au-dessus du seuil'); return ok(false, 10, pos, neg, 0); }
+    if (has(p, 'beneficiaire_ris') || has(p, 'difficulte_financiere_urgente')) {
+      pos.push('Bénéficiaire CPAS ou urgence — orientation directe vers épicerie sociale');
+      score += 20;
+    }
+    pos.push('Plus de 350 000 Belges utilisent ces services — aucune honte');
+    return ok(true, Math.min(100, score), pos, neg, 150);
+  };
+
+  // ── Aide migrants
+  R.aide_migrants = function(p) {
+    var pos = [], neg = [];
+    if (!['réfugié','demandeur_asile','sans papiers admis'].includes(p.nationalite) && !has(p, 'statut_migration')) {
+      return ok(false, 0, pos, ['Réservé aux personnes avec statut migratoire particulier'], 0);
+    }
+    var score = 60;
+    if (p.nationalite === 'demandeur_asile') {
+      pos.push('Demandeur d\'asile en procédure — prise en charge Fedasil : hébergement + allocation de poche');
+      pos.push('Allocation hebdomadaire selon phase : 7€ (phase 1) à 33€/semaine (phase autonomie)');
+      score = 90;
+    } else if (p.nationalite === 'réfugié') {
+      pos.push('Réfugié reconnu — droit au RIS via CPAS dès la sortie du centre Fedasil');
+      score = 85;
+    } else {
+      pos.push('Statut migratoire — contacter le CPAS pour évaluation des droits');
+      neg.push('Droits variables selon le titre de séjour exact');
+    }
+    return ok(true, Math.min(100, score), pos, neg, 600);
+  };
+
+  // ── Maximum à facturer
+  R.maximum_a_facturer = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    pos.push('Droit universel automatique — aucune démarche pour le MAF de base');
+    var seuil; var plafond;
+    if (r < S.maf_1) { seuil = '< 1 688€/mois'; plafond = '450€'; }
+    else if (r < S.maf_2) { seuil = '1 688-2 867€/mois'; plafond = '650€'; }
+    else if (r < S.maf_3) { seuil = '2 867-4 047€/mois'; plafond = '1 000€'; }
+    else { seuil = '> 4 047€/mois'; plafond = '1 800€'; }
+    pos.push('Plafond annuel frais médicaux : ' + plafond + ' (remboursement auto au-delà par mutualité)');
+    return ok(true, 90, pos, neg, null, 'Remboursement automatique en septembre par votre mutualité');
+  };
+
+  // ── Aide dentaire
+  R.aide_dentaire_cpas = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    if (r < 1200) { pos.push('Revenus faibles — accès soins dentaires sociaux probable'); return ok(true, 75, pos, neg, null); }
+    if (r < 1500) { pos.push('Revenus modestes — à vérifier selon CPAS local'); return ok(true, 50, pos, neg, null); }
+    neg.push('Revenus (' + r + '€) potentiellement au-dessus du seuil — vérifiez avec votre CPAS');
+    return ok(false, 20, pos, neg, null);
+  };
+
+  // ── Abonnement social transport
+  R.abonnement_social_transport = function(p) {
+    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, [], ['STIB (BXL) et TEC (Wallonie) uniquement pour le tarif social'], 0);
+    var pos = [], neg = [];
+    var auto = isBenefActuel(p) || p.situation_pro === 'sans_emploi' || parseInt(p.age) >= 65;
+    var score = 20;
+    if (auto) { pos.push('Statut social confirmé — tarif social transport applicable'); score += 65; }
+    if (p.region === 'RBC') { pos.push('STIB social Bruxelles : 60€/an (= 5€/mois) au lieu de 499€ — économie 439€/an'); }
+    if (p.region === 'wallonie') { pos.push('TEC social Wallonie : 12€/mois au lieu de 52€ — économie 480€/an'); }
+    return ok(auto, Math.min(100, score), pos, neg, p.region === 'RBC' ? 37 : 40);
+  };
+
+  // ── Prime vélo RBC
+  R.prime_velo_rbc = function(p) {
+    if (p.region !== 'RBC') return ok(false, 0, [], ['Bruxelles uniquement'], 0);
+    var r = rev(p), pos = [], neg = [];
+    pos.push('Bruxelles — prime vélo accessible à tous les résidents');
+    var prime; var score = 60;
+    if (r * 12 < 35285) { prime = '400€ (électrique) / 50€ (classique)'; score = 80; }
+    else if (r * 12 < 60490) { prime = '200€ (électrique) / 20€ (classique)'; score = 70; }
+    else { prime = '200€ (électrique) / 20€ (classique) — cat. 3'; score = 60; }
+    pos.push('Montant : ' + prime);
+    return ok(true, Math.min(100, score), pos, neg, null);
+  };
+
+  // ── Tarif télécom social
+  R.tarif_telecom_social = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    var auto = isBenefActuel(p) || has(p, 'beneficiaire_ris') || parseInt(p.age) >= 65;
+    var score = 10;
+    if (auto) { pos.push('Statut social — tarif télécom social applicable sur présentation attestation'); score += 65; }
+    if (r < 1200) { pos.push('Revenus faibles — très probablement éligible'); score += 40; }
+    else if (r < S.telecom_revenu_max) { pos.push('Revenus sous le seuil télécom social (1 800€/mois)'); score += 25; }
+    else { neg.push('Revenus (' + r + '€) probablement au-dessus du seuil (1 800€/mois)'); }
+    pos.push('Économie : jusqu\'à 40€/mois sur internet + téléphone fixe');
+    return ok(auto || r < S.telecom_revenu_max, Math.min(100, score), pos, neg, 28);
+  };
+
+  // ── Aide juridique
+  R.aide_juridique = function(p) {
+    var r = rev(p), pos = [], neg = [];
+    var score = 20;
+    if (r < S.aide_juridique_gratuit || isBenefActuel(p) || has(p, 'beneficiaire_ris')) {
+      pos.push('Avocat PRO DEO entièrement GRATUIT — revenus sous le seuil ou statut social');
+      score = 85;
+    } else if (r < S.aide_juridique_partiel) {
+      pos.push('Aide juridique partiellement gratuite (contribution réduite 30-125€)');
+      score = 65;
+    } else {
+      neg.push('Revenus (' + r + '€) au-dessus du seuil de gratuité — aide partielle possible');
+      score = 30;
+    }
+    if (has(p, 'situation_dette')) { pos.push('Médiation de dettes + aide juridique : combo recommandé'); score += 5; }
+    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Urgence juridique possible (expulsion, saisie) — BAJ prioritaire'); score += 5; }
+    return ok(r < S.aide_juridique_partiel || isBenefActuel(p), Math.min(100, score), pos, neg, null);
+  };
+
+  // ── Accompagnement CPAS
+  R.cpas_accompagnement = function(p) {
+    var pos = [];
+    pos.push('Accessible à toute personne en difficulté — aucune condition de revenus requise');
+    pos.push('Aide administrative, orientation, médiation propriétaire/créanciers');
+    return ok(true, 80, pos, [], null, 'Le CPAS accompagne même sans aide financière. Premier RDV libre.');
+  };
+
+  // ── Aide ménagère
+  R.aide_menagere = function(p) {
+    var a = age(p), pos = [], neg = [];
+    if (a < 60 && !has(p, 'handicap') && !has(p, 'maladie_chronique') && p.situation_pro !== 'incapacite') {
+      return ok(false, 0, pos, ['Réservé aux 60+ ou personnes avec perte d\'autonomie'], 0);
+    }
+    if (a >= 60) pos.push('60 ans et plus — aide ménagère CPAS accessible');
+    if (has(p, 'handicap') || has(p, 'maladie_chronique')) pos.push('Perte d\'autonomie — accès quel que soit l\'âge');
+    var r = rev(p);
+    var tarif = r < 1000 ? '4-6€/h' : r < 1500 ? '8-12€/h' : '15-25€/h';
+    pos.push('Tarif horaire selon revenus : ' + tarif);
+    return ok(true, 75, pos, neg, null);
+  };
+
+  // ── Réduction impôt pension
+  R.reduction_impot_pension = function(p) {
+    var pos = [], neg = [];
+    var aides_rev_remp = ['sans_emploi','incapacite','pension'].includes(p.situation_pro);
+    if (!aides_rev_remp && !has(p, 'beneficiaire_ris')) {
+      return ok(false, 0, pos, ['S\'applique aux bénéficiaires de revenus de remplacement'], 0);
+    }
+    pos.push('Revenus de remplacement (chômage, pension, incapacité, RIS) → réduction d\'impôt automatique');
+    pos.push('À déclarer correctement dans la déclaration fiscale annuelle');
+    if (parseInt(p.age) >= 65) { pos.push('65+ : pension minimum souvent exonérée d\'impôt sous certains seuils'); }
+    return ok(true, 70, pos, neg, null, 'Automatique lors de la déclaration fiscale. Vérifiez votre précompte en cours d\'année.');
+  };
+
+  /* ────────────────────────────────────────────────────────────────
+     GÉNÉRATION DE L'ANALYSE TEXTUELLE PERSONNALISÉE
+  ──────────────────────────────────────────────────────────────── */
+  function genererAnalyse(profil, aides) {
+    var r = rev(profil);
+    var a = age(profil);
+    var nb = enfants(profil);
+    var region = { RBC: 'Région de Bruxelles-Capitale', wallonie: 'Wallonie', flandre: 'Flandre' }[profil.region] || profil.region;
+    var sitFam = { seul: 'célibataire', marie: 'en couple', cohabitant: 'cohabitant·e', monoparental: 'parent isolé·e' }[profil.situation_familiale] || profil.situation_familiale;
+    var sitPro = { employe: 'en emploi', sans_emploi: 'sans emploi', independant: 'indépendant·e', etudiant: 'étudiant·e', pension: 'pensionné·e', incapacite: 'en incapacité de travail', autre: 'dans une situation particulière' }[profil.situation_pro] || profil.situation_pro;
+
+    var urgentes = aides.filter(function(a) { return a.urgence; });
+    var montant  = aides.reduce(function(s, aide) {
+      var m = (aide._montant_estime !== undefined && aide._montant_estime !== null) ? aide._montant_estime : (aide.montant_mensuel_max || 0);
+      return s + m;
+    }, 0);
+
+    // Para 1 : portrait de situation
+    var para1 = (profil.prenom || 'Votre profil') + ' est ' + sitFam + ', âgé·e de ' + a + ' ans, ' + sitPro + ', et réside en ' + region + '. ';
+    if (r === 0) {
+      para1 += 'Sans revenu déclaré, vous êtes dans une situation de précarité sévère qui nécessite une intervention rapide du CPAS. ';
+    } else if (r < 700) {
+      para1 += 'Avec ' + r + '€ de revenus nets par mois, votre situation est critique et vous ouvre droit à l\'ensemble des aides de base. ';
+    } else if (r < 1200) {
+      para1 += 'Avec ' + Math.round(r) + '€ de revenus nets par mois, votre situation est précaire et vous avez droit à de nombreuses aides cumulables. ';
+    } else if (r < 1800) {
+      para1 += 'Avec ' + Math.round(r) + '€ de revenus nets par mois, votre situation est modeste et plusieurs aides ciblées s\'appliquent à votre profil. ';
+    } else {
+      para1 += 'Avec ' + Math.round(r) + '€ de revenus nets par mois, certaines aides restent accessibles selon votre composition de ménage. ';
+    }
+    if (nb > 0) {
+      para1 += 'La présence de ' + nb + ' enfant(s) à charge élargit plusieurs seuils d\'éligibilité et ouvre des droits supplémentaires (allocations familiales, suppléments sociaux, aide scolaire). ';
+    }
+    if (has(profil, 'handicap') || has(profil, 'maladie_chronique')) {
+      para1 += 'Votre situation de handicap ou maladie chronique ouvre des droits spécifiques importants à travers le SPF Sécurité Sociale. ';
+    }
+
+    // Para 2 : droits identifiés
+    var top5 = aides.slice(0, 5).map(function(a) { return a.nom; }).join(', ');
+    var para2 = 'Nous avons identifié ' + aides.length + ' aide(s) pour lesquelles vous présentez une éligibilité potentielle, pour un potentiel mensuel estimé à ' + montant.toLocaleString('fr-BE') + '€. ';
+    if (aides.length > 0) {
+      para2 += 'Les principales sont : ' + top5 + '. Ces aides sont cumulables entre elles dans la plupart des cas — c\'est précisément ce que beaucoup de bénéficiaires ignorent. ';
+    }
+    if (has(profil, 'situation_dette')) {
+      para2 += 'La médiation de dettes gratuite via le CPAS peut vous permettre de restructurer vos dettes et stopper les poursuites — ne négligez pas cette démarche. ';
+    }
+    if (profil.situation_pro === 'sans_emploi') {
+      para2 += 'En tant que chercheur·euse d\'emploi, des formations gratuites et des primes à l\'embauche (Activa/Win-Win) peuvent faciliter votre retour à l\'emploi. ';
+    }
+
+    // Para 3 : démarches concrètes
+    var para3 = 'Prochaine étape concrète : ';
+    if (urgentes.length > 0) {
+      para3 += 'Contactez en priorité votre CPAS à ' + (profil.commune || 'votre commune') + ' — ' + urgentes.length + ' aide(s) urgente(s) peuvent être accordées sous 24 à 48 heures. ';
+    } else {
+      para3 += 'Prenez rendez-vous avec votre CPAS pour un bilan social complet — le CPAS peut initier plusieurs demandes simultanément. ';
+    }
+    if (profil.region === 'RBC') {
+      para3 += 'Pour les aides régionales bruxelloises : Iriscare (allocations familiales), logement.brussels (allocation loyer), Bruxelles Environnement (RENOLUTION). ';
+    } else if (profil.region === 'wallonie') {
+      para3 += 'Pour les aides wallonnes : appelez le 1718 (gratuit, SPW Énergie/Logement) et le 081 25 25 25 (Famiwal). ';
+    }
+    para3 += 'Ce dossier est indicatif basé sur votre profil déclaratif. L\'éligibilité définitive est confirmée par chaque organisme lors de votre demande.';
+
+    return para1.trim() + '\n\n' + para2.trim() + '\n\n' + para3.trim();
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+     POINT D'ENTRÉE PRINCIPAL
+  ──────────────────────────────────────────────────────────────── */
+  window.analyserProfil = function(profil) {
+    var resultats = [];
+    var details   = {};
+
+    for (var i = 0; i < window.AIDES_DB.length; i++) {
+      var aide = window.AIDES_DB[i];
+      var regle = R[aide.id];
+      var evaluation;
+
+      if (regle) {
+        evaluation = regle(profil);
+      } else {
+        // Règle générique pour les aides sans règle spécifique
+        var c = aide.conditions || {};
+        var region = profil.region;
+        var r2 = rev(profil);
+        var a2 = age(profil);
+        var eligible = true;
+        if (c.residences && c.residences.indexOf(region) === -1) eligible = false;
+        if (c.age_min && a2 < c.age_min) eligible = false;
+        if (c.age_max && a2 > c.age_max) eligible = false;
+        if (c.revenu_max_mensuel && r2 > c.revenu_max_mensuel * 1.1) eligible = false;
+        evaluation = ok(eligible, eligible ? 50 : 0, [], [], null);
+      }
+
+      details[aide.id] = evaluation;
+
+      if (evaluation.eligible && evaluation.score >= 15) {
+        resultats.push({ aide: aide, score: evaluation.score, evaluation: evaluation });
+      }
+    }
+
+    // Tri : urgences en tête, puis score décroissant
+    resultats.sort(function(a, b) {
+      var urgA = a.aide.urgence ? 1 : 0;
+      var urgB = b.aide.urgence ? 1 : 0;
+      if (urgA !== urgB) return urgB - urgA;
+      return b.score - a.score;
+    });
+
+    var aidesFinales = resultats.map(function(r) {
+      var aide = Object.assign({}, r.aide);
+      if (r.evaluation.montant_estime !== null && r.evaluation.montant_estime !== undefined) {
+        aide._montant_estime = r.evaluation.montant_estime;
+      }
+      aide._score      = r.score;
+      aide._motifs_pos = r.evaluation.motifs_positifs;
+      aide._motifs_neg = r.evaluation.motifs_negatifs;
+      aide._note       = r.evaluation.note_specifique;
+      return aide;
+    });
+
+    var analyse = genererAnalyse(profil, aidesFinales);
+    return { aides: aidesFinales, analyse: analyse, details: details };
+  };
+
+  // Rétrocompatibilité
+  window.preselectAides = function(profil) {
+    return window.analyserProfil(profil).aides;
+  };
+
+})();
+
+
+/* === BASE DE DONNÉES AIDES === */
 /**
  * AIDES_V2.JS — Base de données complète des aides sociales belges
  * Version 2 — 55+ aides, montants différenciés par statut, conditions précises
@@ -2950,890 +3834,6 @@ window.preselectAides = function(profil) {
     return true;
   });
 };
-
-
-/* === MOTEUR REGLES === */
-/**
- * MOTEUR_V2.JS — Moteur de règles précis pour Waqf IA
- * Correspond à aides_v2.js — 55 aides, seuils légaux 2024-2025
- * Aucune dépendance externe. 100% local. 100% gratuit.
- */
-(function() {
-  'use strict';
-
-  /* ────────────────────────────────────────────────────────────────
-     SEUILS LÉGAUX BELGES 2024-2025
-  ──────────────────────────────────────────────────────────────── */
-  var S = {
-    // RIS
-    ris_isole:         1301.05,
-    ris_cohabitant:    867.37,
-    ris_chef_menage:   1301.05,
-    // GRAPA
-    grapa_isole:       1107.72,
-    grapa_couple:      739.08,
-    // BIM / OMNIO — revenus BRUTS annuels
-    bim_isole_annuel:  20611,
-    bim_par_enfant:    5151,
-    // Allocation loyer (RBC et Wallonie identiques)
-    loyer_1p:  1563,
-    loyer_2p:  1940,
-    loyer_3p:  2375,
-    // Allocation monoparentale
-    monop_revenu_max:  1852,
-    // Supplément social wallon
-    supp_wall_revenu_max: 2600,
-    // Allocations familiales — supplément BIM-like
-    af_supplement_revenu_max: 2813,
-    // Bourse d'études FWB
-    bourse_annuel_max: 31015,
-    // Tarif social télécom
-    telecom_revenu_max: 1800,
-    // Fonds mazout
-    mazout_isole: 1943,
-    mazout_couple: 2589,
-    mazout_par_pers: 175,
-    // Aide juridique gratuite
-    aide_juridique_gratuit: 1500,
-    aide_juridique_partiel: 1800,
-    // MAF
-    maf_1: 20260 / 12,
-    maf_2: 34412 / 12,
-    maf_3: 48561 / 12,
-  };
-
-  /* ────────────────────────────────────────────────────────────────
-     UTILITAIRES
-  ──────────────────────────────────────────────────────────────── */
-
-  function rev(p) {
-    var principal = parseFloat(p.revenus_nets) || 0;
-    var autresStr = p.autres_revenus || '';
-    var m = autresStr.match(/(\d[\d ,.]*)\s*(?:€|eur)/i);
-    var autres = m ? parseFloat(m[1].replace(/[\s]/g, '').replace(',', '.')) : 0;
-    return principal + autres;
-  }
-
-  function age(p) { return parseInt(p.age) || 0; }
-  function enfants(p) { return parseInt(p.nb_enfants) || 0; }
-  function loyer(p) { return parseFloat(p.loyer) || 0; }
-
-  function has(p, val) {
-    return Array.isArray(p.situation_speciale) && p.situation_speciale.indexOf(val) !== -1;
-  }
-
-  function seuilLoyer(p) {
-    if (p.situation_familiale === 'seul') return S.loyer_1p;
-    if (enfants(p) >= 1) return S.loyer_3p;
-    return S.loyer_2p;
-  }
-
-  function bimMensuel(p) {
-    var base = S.bim_isole_annuel;
-    var pers = p.situation_familiale === 'marie' || p.situation_familiale === 'cohabitant' ? 1 : 0;
-    pers += enfants(p);
-    return (base + pers * S.bim_par_enfant) / 12;
-  }
-
-  function isBenefActuel(p) {
-    // Bénéficie déjà d'une allocation sociale majeure
-    return has(p, 'beneficiaire_ris')
-      || p.situation_pro === 'incapacite'
-      || has(p, 'handicap');
-  }
-
-  function ok(eligible, score, pos, neg, montant, note) {
-    return { eligible: eligible, score: score, motifs_positifs: pos, motifs_negatifs: neg, montant_estime: montant || null, note_specifique: note || null };
-  }
-
-  /* ────────────────────────────────────────────────────────────────
-     RÈGLES PAR AIDE — une fonction par id d'aide
-  ──────────────────────────────────────────────────────────────── */
-  var R = {};
-
-  // ── RIS isolé
-  R.ris_isole = function(p) {
-    var r = rev(p), a = age(p), pos = [], neg = [];
-    if (a < 18) return ok(false, 0, pos, ['Âge minimum 18 ans'], 0);
-    pos.push('Âge ≥ 18 ans');
-    if (p.situation_familiale !== 'seul') return ok(false, 0, pos, ['Statut isolé·e requis — voir RIS chef de ménage ou cohabitant'], 0);
-    pos.push('Statut isolé confirmé');
-    if (!['belge','UE','réfugié'].includes(p.nationalite)) neg.push('Nationalité à vérifier avec le CPAS');
-    var plafond = S.ris_isole;
-    var complement = Math.max(0, plafond - r);
-    var score = 20;
-    if (r === 0) { pos.push('Aucun revenu — RIS maximal probable'); score += 65; }
-    else if (r < plafond * 0.5) { pos.push('Revenus (' + r + '€) bien inférieurs au plafond (' + Math.round(plafond) + '€)'); score += 50; }
-    else if (r < plafond) { pos.push('Revenus (' + r + '€) inférieurs au plafond RIS'); score += 30; }
-    else { neg.push('Revenus (' + r + '€) dépassent le plafond RIS (' + Math.round(plafond) + '€)'); return ok(false, 10, pos, neg, 0); }
-    if (['sans_emploi','etudiant','incapacite','autre'].includes(p.situation_pro)) { pos.push('Situation professionnelle compatible'); score += 10; }
-    return ok(true, Math.min(100, score), pos, neg, Math.round(complement),
-      complement < 100 ? 'Complément estimé faible — le CPAS peut proposer des aides en nature complémentaires' : null);
-  };
-
-  // ── RIS cohabitant
-  R.ris_cohabitant = function(p) {
-    var r = rev(p), a = age(p), pos = [], neg = [];
-    if (a < 18) return ok(false, 0, pos, ['Âge minimum 18 ans'], 0);
-    if (p.situation_familiale !== 'cohabitant') return ok(false, 0, pos, ['Statut cohabitant requis'], 0);
-    pos.push('Statut cohabitant confirmé');
-    var plafond = S.ris_cohabitant;
-    var complement = Math.max(0, plafond - r);
-    var score = 20;
-    if (r < plafond * 0.5) { pos.push('Revenus bien inférieurs au plafond cohabitant (' + Math.round(plafond) + '€)'); score += 55; }
-    else if (r < plafond) { pos.push('Revenus (' + r + '€) sous le plafond'); score += 30; }
-    else { neg.push('Revenus (' + r + '€) dépassent le plafond cohabitant (' + Math.round(plafond) + '€)'); return ok(false, 5, pos, neg, 0); }
-    neg.push('Le CPAS vérifie les revenus de TOUS les cohabitants — montant peut être revu');
-    return ok(true, Math.min(100, score), pos, neg, Math.round(complement));
-  };
-
-  // ── RIS chef de ménage
-  R.ris_chef_menage = function(p) {
-    var r = rev(p), a = age(p), pos = [], neg = [];
-    if (a < 18) return ok(false, 0, pos, ['Âge minimum 18 ans'], 0);
-    var sitOk = p.situation_familiale === 'monoparental' || p.situation_familiale === 'marie';
-    if (!sitOk) return ok(false, 0, pos, ['Réservé aux parents isolés et chefs de ménage avec personne à charge'], 0);
-    if (p.situation_familiale === 'monoparental') { pos.push('Parent isolé — statut chef de ménage'); }
-    else { pos.push('Chef de ménage avec personne à charge'); }
-    var plafond = S.ris_chef_menage;
-    var complement = Math.max(0, plafond - r);
-    var score = 25;
-    if (r === 0) { pos.push('Aucun revenu — aide maximale'); score += 60; }
-    else if (r < plafond * 0.5) { pos.push('Revenus (' + r + '€) très inférieurs au plafond (' + Math.round(plafond) + '€)'); score += 50; }
-    else if (r < plafond) { pos.push('Revenus sous le plafond RIS chef de ménage'); score += 30; }
-    else { neg.push('Revenus (' + r + '€) dépassent le plafond (' + Math.round(plafond) + '€)'); return ok(false, 10, pos, neg, 0); }
-    if (enfants(p) > 0) { pos.push(enfants(p) + ' enfant(s) à charge — droits renforcés'); score += 5; }
-    return ok(true, Math.min(100, score), pos, neg, Math.round(complement));
-  };
-
-  // ── Allocation chômage
-  R.allocation_chomage = function(p) {
-    var r = rev(p), a = age(p), pos = [], neg = [];
-    if (p.situation_pro !== 'sans_emploi') return ok(false, 0, pos, ['Réservé aux personnes sans emploi involontairement'], 0);
-    if (a < 18 || a > 65) { neg.push('Âge hors tranche 18-65'); return ok(false, 10, pos, neg, 0); }
-    pos.push('Situation de chômage — condition principale');
-    pos.push('Contactez immédiatement un syndicat (FGTB, CSC, CGSLB) ou la CAPAC pour déposer le C4');
-    var score = 50;
-    if (r === 0) { pos.push('Aucun revenu déclaré — probablement en attente de paiement'); score += 20; }
-    neg.push('Requiert un historique de travail (180 jours dans les 18 mois ou 312 jours dans les 27 mois selon âge)');
-    var taux = (p.situation_familiale === 'seul' || p.situation_familiale === 'monoparental') ? 0.65 : 0.60;
-    var estim = r > 0 ? Math.min(Math.round(r * taux), 1783) : 1100;
-    return ok(true, Math.min(100, score), pos, neg, estim,
-      'Montant calculé par l\'ONEM sur base du salaire brut précédent. Dépôt urgent requis.');
-  };
-
-  // ── Indemnité incapacité
-  R.indemnite_incapacite = function(p) {
-    var pos = [], neg = [];
-    if (p.situation_pro !== 'incapacite' && !has(p, 'maladie_chronique')) {
-      return ok(false, 0, pos, ['Réservé aux personnes en incapacité de travail reconnue'], 0);
-    }
-    pos.push('Situation d\'incapacité de travail ou maladie chronique signalée');
-    pos.push('Reconnaissance par le médecin-conseil de votre mutualité obligatoire');
-    var score = 55;
-    var r = rev(p);
-    var estim = r > 0 ? Math.round(r * 0.60) : 1200;
-    if (has(p, 'maladie_chronique')) { pos.push('Maladie chronique — droits potentiels longue durée'); score += 15; }
-    neg.push('Délai de carence : 1 jour (salariés). Notification mutualité dans les 48h obligatoire.');
-    return ok(true, Math.min(100, score), pos, neg, estim);
-  };
-
-  // ── Accident travail
-  R.accident_travail = function(p) {
-    var pos = [], neg = [];
-    if (p.situation_pro !== 'incapacite') return ok(false, 0, pos, ['Réservé aux accidents du travail / maladies professionnelles'], 0);
-    pos.push('Incapacité de travail signalée — vérifier si origine professionnelle');
-    neg.push('Applicable uniquement si l\'incapacité est due à un accident du travail ou trajet');
-    neg.push('Déclaration de l\'accident à faire par l\'employeur dans les 8 jours');
-    return ok(true, 40, pos, neg, null, 'À vérifier selon l\'origine de l\'incapacité');
-  };
-
-  // ── Prime embauche Activa
-  R.prime_embauche_activa = function(p) {
-    var pos = [], neg = [];
-    if (p.situation_pro !== 'sans_emploi') return ok(false, 0, pos, ['Réservé aux chercheurs d\'emploi'], 0);
-    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, pos, ['ACTIRIS (BXL) et FOREm (Wallonie) uniquement'], 0);
-    pos.push('Chercheur d\'emploi en région francophone — éligible ACTIRIS/FOREm');
-    pos.push('La prime facilite votre embauche : l\'employeur reçoit jusqu\'à 800€/mois de réduction');
-    var score = 55;
-    var a = age(p);
-    if (a < 26) { pos.push('Jeune ≤ 25 ans — programmes prioritaires et délai réduit (3 mois)'); score += 20; }
-    if (a > 50) { pos.push('50+ : programme spécifique Activa seniors'); score += 15; }
-    neg.push('Nécessite inscription préalable comme DE (demandeur d\'emploi) depuis ≥ 6 mois');
-    return ok(true, Math.min(100, score), pos, neg, 0);
-  };
-
-  // ── Allocations familiales RBC
-  R.allocations_familiales_rbc = function(p) {
-    if (p.region !== 'RBC') return ok(false, 0, [], ['Iriscare — Bruxelles-Capitale uniquement'], 0);
-    if (enfants(p) < 1) return ok(false, 0, [], ['Au moins 1 enfant à charge requis'], 0);
-    var pos = [], neg = [];
-    pos.push('Bruxelles + enfant(s) à charge — droit universel sans condition de revenus');
-    var montantBase = enfants(p) === 1 ? 165 : enfants(p) === 2 ? 307 : 521;
-    var score = 90;
-    var r = rev(p);
-    if (r < S.af_supplement_revenu_max) { pos.push('Revenus < 2 813€/mois — supplément social +53€/enfant probable'); score = 95; }
-    if (p.situation_familiale === 'monoparental') { pos.push('Famille monoparentale — supplément +46€/enfant automatique'); }
-    pos.push('Montant de base : ' + montantBase + '€/mois (1er enfant 165€, 2e 307€, 3e+ 521€)');
-    return ok(true, Math.min(100, score), pos, neg, montantBase + enfants(p) * 46);
-  };
-
-  // ── Allocations familiales Wallonie
-  R.allocations_familiales_wallonie = function(p) {
-    if (p.region !== 'wallonie') return ok(false, 0, [], ['Famiwal — Wallonie uniquement'], 0);
-    if (enfants(p) < 1) return ok(false, 0, [], ['Au moins 1 enfant à charge requis'], 0);
-    var pos = [], neg = [];
-    pos.push('Wallonie + enfant(s) — droit universel');
-    var montantBase = enfants(p) === 1 ? 174 : enfants(p) === 2 ? 321 : 481;
-    var score = 90;
-    var r = rev(p);
-    if (r < S.supp_wall_revenu_max) { pos.push('Revenus < 2 600€/mois — supplément social +133€/mois éligible'); score = 95; }
-    pos.push('Montant de base : ' + montantBase + '€/mois');
-    return ok(true, Math.min(100, score), pos, neg, montantBase + (r < S.supp_wall_revenu_max ? 133 : 0));
-  };
-
-  // ── Supplément monoparental RBC
-  R.supplement_monoparental_rbc = function(p) {
-    if (p.region !== 'RBC') return ok(false, 0, [], ['Iriscare — Bruxelles uniquement'], 0);
-    if (p.situation_familiale !== 'monoparental') return ok(false, 0, [], ['Réservé aux parents isolés'], 0);
-    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) requis'], 0);
-    return ok(true, 95, ['Bruxelles + parent isolé + enfant(s) — automatique avec AF'], [],
-      46 * enfants(p), 'S\'ajoute automatiquement aux allocations familiales Iriscare');
-  };
-
-  // ── Supplément social Wallonie
-  R.supplement_monoparental_wall = function(p) {
-    if (p.region !== 'wallonie') return ok(false, 0, [], ['Famiwal — Wallonie uniquement'], 0);
-    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) requis'], 0);
-    var r = rev(p);
-    var pos = [], neg = [];
-    if (r < S.supp_wall_revenu_max) {
-      pos.push('Revenus (' + r + '€) inférieurs au seuil wallon (2 600€) — supplément applicable');
-      return ok(true, 90, pos, neg, 133 * Math.min(enfants(p), 3));
-    }
-    neg.push('Revenus (' + r + '€) au-dessus du seuil 2 600€/mois');
-    return ok(false, 10, pos, neg, 0);
-  };
-
-  // ── Allocation monoparentale fédérale
-  R.allocation_monoparentale = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    if (p.situation_familiale !== 'monoparental') return ok(false, 0, pos, ['Réservé aux parents isolés'], 0);
-    if (enfants(p) < 1) return ok(false, 0, pos, ['Enfant(s) à charge requis'], 0);
-    pos.push('Parent isolé + enfant(s) — conditions de base remplies');
-    var score = 30;
-    if (r < S.monop_revenu_max * 0.7) { pos.push('Revenus faibles — éligibilité forte'); score += 55; }
-    else if (r < S.monop_revenu_max) { pos.push('Revenus (' + r + '€) sous le plafond (' + S.monop_revenu_max + '€)'); score += 35; }
-    else { neg.push('Revenus (' + r + '€) dépassent le plafond (' + S.monop_revenu_max + '€)'); return ok(false, 10, pos, neg, 0); }
-    return ok(true, Math.min(100, score), pos, neg, 192);
-  };
-
-  // ── Prime naissance RBC
-  R.prime_naissance_rbc = function(p) {
-    if (p.region !== 'RBC') return ok(false, 0, [], ['Iriscare — Bruxelles uniquement'], 0);
-    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) requis'], 0);
-    var montant = enfants(p) === 1 ? 1086 : 814;
-    return ok(true, 90, ['Bruxelles + enfant(s) — droit universel sans condition de revenus'], [],
-      null, 'Prime unique de ' + montant + '€ par enfant (1 086€ pour le 1er, 814€ ensuite)');
-  };
-
-  // ── Prime naissance Wallonie
-  R.prime_naissance_wallonie = function(p) {
-    if (p.region !== 'wallonie') return ok(false, 0, [], ['Famiwal — Wallonie uniquement'], 0);
-    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) requis'], 0);
-    var montant = enfants(p) === 1 ? 1232 : 924;
-    return ok(true, 90, ['Wallonie + enfant(s) — droit universel'], [],
-      null, 'Prime unique de ' + montant + '€ (1 232€ pour le 1er, 924€ ensuite)');
-  };
-
-  // ── Allocation handicap
-  R.allocation_handicap = function(p) {
-    var a = age(p), r = rev(p), pos = [], neg = [];
-    if (!has(p, 'handicap') && !has(p, 'maladie_chronique')) {
-      return ok(false, 0, pos, ['Requiert un handicap reconnu ou en cours de reconnaissance'], 0);
-    }
-    pos.push('Handicap / maladie chronique signalé(e)');
-    if (a < 21) { neg.push('Âge minimum 21 ans (en dessous → allocation enfant handicapé)'); return ok(false, 15, pos, neg, 0); }
-    if (a > 65) { neg.push('Après 65 ans → APA (allocation aide personnes âgées) à la place'); return ok(false, 15, pos, neg, 0); }
-    pos.push('Âge conforme (21-65 ans)');
-    var score = 40;
-    if (r < 1200) { pos.push('Revenus faibles — catégorie supérieure probable'); score += 35; }
-    else if (r < 2200) { pos.push('Revenus dans les seuils admissibles'); score += 20; }
-    else { neg.push('Revenus proches ou au-delà du plafond — à vérifier selon composition ménage'); }
-    neg.push('Évaluation médicale obligatoire par le SPF — 3 à 6 mois de procédure');
-    return ok(true, Math.min(100, score), pos, neg, 476, 'Catégorie 3 par défaut — montant définitif selon évaluation médicale (110 à 918€/mois)');
-  };
-
-  // ── APA seniors
-  R.allocation_aide_agees = function(p) {
-    var a = age(p), pos = [], neg = [];
-    if (a < 65) return ok(false, 0, pos, ['Réservé aux 65 ans et plus'], 0);
-    if (!has(p, 'handicap') && !has(p, 'maladie_chronique') && p.situation_pro !== 'incapacite') {
-      neg.push('Requiert une perte d\'autonomie reconnue (maladie, handicap, dépendance)');
-      return ok(false, 20, pos, neg, 0);
-    }
-    pos.push('65+ avec perte d\'autonomie signalée — APA potentiellement éligible');
-    var r = rev(p);
-    var score = 50;
-    if (r < 1500) { pos.push('Revenus faibles — allocations complémentaires maximales possibles'); score += 30; }
-    neg.push('Évaluation médicale par le SPF obligatoire (3-6 mois)');
-    return ok(true, Math.min(100, score), pos, neg, 476);
-  };
-
-  // ── GRAPA
-  R.grapa = function(p) {
-    var a = age(p), r = rev(p), pos = [], neg = [];
-    if (a < 65) return ok(false, 0, pos, ['Réservé aux 65 ans et plus'], 0);
-    pos.push('Âge ≥ 65 ans');
-    var plafond = (p.situation_familiale === 'marie' || p.situation_familiale === 'cohabitant') ? S.grapa_couple : S.grapa_isole;
-    var complement = Math.max(0, plafond - r);
-    var score = 40;
-    if (r < plafond * 0.5) { pos.push('Pension très insuffisante — GRAPA quasi certaine'); score += 50; }
-    else if (r < plafond) { pos.push('Revenus (' + r + '€) inférieurs au plafond GRAPA (' + Math.round(plafond) + '€)'); score += 35; }
-    else { neg.push('Revenus (' + r + '€) dépassent le plafond GRAPA — non éligible'); return ok(false, 5, pos, neg, 0); }
-    if (p.situation_pro === 'pension') { pos.push('Statut pensionné — SFP propose souvent automatiquement'); score += 5; }
-    return ok(true, Math.min(100, score), pos, neg, Math.round(complement), 'Le SFP peut proposer automatiquement — vérifiez sur mypension.be');
-  };
-
-  // ── BIM
-  R.bim = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    var seuil = bimMensuel(p);
-    var auto = has(p, 'beneficiaire_ris') || p.situation_pro === 'incapacite' || has(p, 'handicap') || parseInt(p.age) >= 65 || p.situation_pro === 'sans_emploi';
-    var score = 15;
-    if (auto) { pos.push('Accordé automatiquement selon statut — à signaler à votre mutualité'); score += 65; }
-    if (r * 12 < S.bim_isole_annuel + enfants(p) * S.bim_par_enfant) {
-      pos.push('Revenus annuels (' + Math.round(r * 12) + '€) inférieurs au seuil BIM');
-      score += 35;
-    } else if (r < seuil * 1.1) {
-      pos.push('Revenus proches du seuil — à vérifier auprès de la mutualité');
-      score += 15;
-    } else {
-      neg.push('Revenus possiblement au-dessus du seuil BIM — vérifiez avec la mutualité');
-    }
-    if (enfants(p) > 0) { pos.push(enfants(p) + ' enfant(s) — seuil BIM augmenté de ' + (enfants(p) * S.bim_par_enfant) + '€/an'); score += 10; }
-    if (p.situation_familiale === 'monoparental') { pos.push('Famille monoparentale — seuil majoré'); score += 5; }
-    return ok(auto || r * 12 < S.bim_isole_annuel + enfants(p) * S.bim_par_enfant + 5000, Math.min(100, score), pos, neg, 80);
-  };
-
-  // ── OMNIO
-  R.omnio = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    var seuilMens = (S.bim_isole_annuel + enfants(p) * S.bim_par_enfant) / 12;
-    if (isBenefActuel(p)) {
-      return ok(false, 0, pos, ['BIM automatique applicable — OMNIO est la voie revenus pour non-bénéficiaires d\'allocation'], 0);
-    }
-    if (r < seuilMens) {
-      pos.push('Revenus sous le seuil OMNIO — demande active à faire auprès de la mutualité');
-      pos.push('Mêmes avantages que le BIM — valable 1 an renouvelable');
-      return ok(true, 75, pos, neg, 70);
-    }
-    neg.push('Revenus (' + Math.round(r) + '€) probablement au-delà du seuil mensuel (' + Math.round(seuilMens) + '€)');
-    return ok(false, 10, pos, neg, 0);
-  };
-
-  // ── Tarif social énergie
-  R.tarif_social_energie = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    var auto = has(p, 'beneficiaire_ris') || p.situation_pro === 'incapacite' || has(p, 'handicap') || parseInt(p.age) >= 65;
-    var score = 10;
-    if (auto) { pos.push('Accordé automatiquement — vérifiez que votre fournisseur l\'applique'); score += 70; }
-    if (r < 1200) { pos.push('Revenus très bas — tarif social quasi certain'); score += 40; }
-    else if (r < 1600) { pos.push('Revenus modestes — probablement éligible'); score += 25; }
-    else if (r < 1943) { pos.push('Revenus dans la fourchette éligible'); score += 15; }
-    else { neg.push('Revenus (' + r + '€) possiblement trop élevés — à vérifier'); }
-    if (!auto && r >= 1943) return ok(false, 10, pos, neg, 0);
-    return ok(true, Math.min(100, score), pos, neg, 65);
-  };
-
-  // ── Prime énergie Wallonie
-  R.prime_energie_wallonie = function(p) {
-    if (p.region !== 'wallonie') return ok(false, 0, [], ['Réservé à la Wallonie'], 0);
-    var r = rev(p), pos = [], neg = [];
-    pos.push('Région wallonne — primes RENOWATT et programme MEBAR disponibles');
-    var score = 20;
-    if (['proprietaire','locataire_prive','locataire_social'].includes(p.logement)) {
-      pos.push('Statut de logement compatible'); score += 20;
-    } else if (p.logement === 'heberge') {
-      neg.push('Hébergé — accord du logeur nécessaire pour travaux');
-    }
-    var plaf = enfants(p) > 0 || p.situation_familiale !== 'seul' ? 2600 : 2000;
-    if (r < plaf * 0.7) { pos.push('Revenus faibles — taux majoré MEBAR applicable (aide urgente possible)'); score += 40; }
-    else if (r < plaf) { pos.push('Revenus dans la tranche standard'); score += 20; }
-    else { neg.push('Revenus (' + r + '€) au-dessus du plafond MEBAR — primes RENOWATT standard applicables'); score += 10; }
-    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Urgence énergétique — programme MEBAR chauffage prioritaire'); score += 15; }
-    return ok(true, Math.min(100, score), pos, neg, null);
-  };
-
-  // ── Prime énergie RBC
-  R.prime_energie_rbc = function(p) {
-    if (p.region !== 'RBC') return ok(false, 0, [], ['RENOLUTION — Bruxelles uniquement'], 0);
-    var r = rev(p), pos = [], neg = [];
-    if (!['proprietaire','locataire_prive'].includes(p.logement)) {
-      neg.push('Requiert d\'être propriétaire ou locataire avec accord du propriétaire');
-      return ok(false, 10, pos, neg, 0);
-    }
-    pos.push('Bruxelles + statut logement compatible — RENOLUTION disponible');
-    var score = 30;
-    if (r * 12 < 35285) { pos.push('Catégorie 1 (revenus < 35 285€/an) — taux 50-70% des travaux'); score += 40; }
-    else if (r * 12 < 60490) { pos.push('Catégorie 2 — taux 30-50% des travaux'); score += 25; }
-    else { pos.push('Catégorie 3 — taux 15-30% des travaux'); score += 10; }
-    return ok(true, Math.min(100, score), pos, neg, null);
-  };
-
-  // ── Fonds mazout
-  R.fonds_mazout = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    var plaf = p.situation_familiale === 'seul' ? S.mazout_isole : S.mazout_couple + enfants(p) * S.mazout_par_pers;
-    var auto = isBenefActuel(p) || parseInt(p.age) >= 65;
-    if (!auto && r >= plaf) return ok(false, 0, pos, ['Revenus (' + r + '€) supérieurs au plafond (' + Math.round(plaf) + '€) — non éligible'], 0);
-    if (auto) pos.push('Bénéficiaire allocation sociale — réduction automatique sur présentation d\'attestation');
-    else pos.push('Revenus (' + r + '€) sous le plafond mazout (' + Math.round(plaf) + '€)');
-    neg.push('Uniquement pour les logements chauffés au mazout ou propane');
-    return ok(true, auto ? 85 : 70, pos, neg, null);
-  };
-
-  // ── Avance loyer CPAS
-  R.avance_loyer_cpas = function(p) {
-    var pos = [], neg = [];
-    if (!has(p, 'difficulte_financiere_urgente') && loyer(p) === 0) {
-      return ok(false, 20, pos, ['Cette aide cible les locataires en difficulté urgente'], 0);
-    }
-    pos.push('Aide urgente CPAS disponible pour locataires en difficulté');
-    var score = 30;
-    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Situation d\'urgence financière déclarée — priorité CPAS'); score += 50; }
-    if (['locataire_prive','locataire_social'].includes(p.logement)) { pos.push('Locataire — avance sur loyer ou garantie locative éligible'); score += 20; }
-    if (p.logement === 'sans_domicile') { pos.push('Sans domicile fixe — orientation CPAS urgente vers logement'); score += 30; }
-    var loy = loyer(p);
-    return ok(true, Math.min(100, score), pos, neg, loy > 0 ? Math.min(loy * 2, 1600) : 800,
-      'La garantie locative CPAS (2 mois de loyer) est un prêt sans intérêt remboursable progressivement');
-  };
-
-  // ── Allocation loyer RBC
-  R.allocation_loyer_rbc = function(p) {
-    if (p.region !== 'RBC') return ok(false, 0, [], ['Bruxelles-Capitale uniquement'], 0);
-    var r = rev(p), pos = [], neg = [];
-    if (p.logement !== 'locataire_prive') return ok(false, 0, pos, ['Réservé aux locataires du secteur privé bruxellois'], 0);
-    pos.push('Bruxelles + locataire privé');
-    var seuil = seuilLoyer(p);
-    var score = 20;
-    if (!has(p, 'liste_logement_social')) {
-      neg.push('CONDITION CLÉ : inscription sur liste d\'attente logement social bruxellois depuis ≥ 1 an requise');
-      score -= 15;
-    } else {
-      pos.push('Inscription liste logement social confirmée — condition principale remplie'); score += 30;
-    }
-    if (loyer(p) > 0 && loyer(p) <= 1050) { pos.push('Loyer (' + loyer(p) + '€) dans la limite autorisée (1 050€)'); score += 15; }
-    else if (loyer(p) > 1050) { neg.push('Loyer (' + loyer(p) + '€) dépasse le plafond de 1 050€/mois'); }
-    if (r < seuil * 0.6) { pos.push('Revenus très faibles — montant max 240€/mois probable'); score += 40; }
-    else if (r < seuil) { pos.push('Revenus (' + r + '€) sous le plafond (' + Math.round(seuil) + '€)'); score += 25; }
-    else { neg.push('Revenus (' + r + '€) dépassent le plafond (' + Math.round(seuil) + '€)'); return ok(false, 10, pos, neg, 0); }
-    var montant = r < seuil * 0.4 ? 240 : r < seuil * 0.65 ? 160 : 80;
-    return ok(true, Math.min(100, score), pos, neg, montant);
-  };
-
-  // ── Loyer wallon
-  R.loyer_wallon = function(p) {
-    if (p.region !== 'wallonie') return ok(false, 0, [], ['Wallonie uniquement'], 0);
-    var r = rev(p), pos = [], neg = [];
-    if (p.logement !== 'locataire_prive') return ok(false, 0, pos, ['Réservé aux locataires du secteur privé wallon'], 0);
-    pos.push('Wallonie + locataire privé');
-    var seuil = seuilLoyer(p);
-    var score = 20;
-    if (!has(p, 'liste_logement_social')) {
-      neg.push('CONDITION CLÉ : inscription liste logement social wallon depuis ≥ 1 an obligatoire');
-      score -= 10;
-    } else {
-      pos.push('Inscription liste logement social wallon — condition principale'); score += 35;
-    }
-    if (loyer(p) > 0 && loyer(p) <= 900) { pos.push('Loyer (' + loyer(p) + '€) dans la limite wallonne (900€)'); score += 15; }
-    else if (loyer(p) > 900) { neg.push('Loyer (' + loyer(p) + '€) dépasse le plafond wallon (900€)'); }
-    if (r < seuil * 0.6) { pos.push('Revenus très faibles — montant max 192€/mois probable'); score += 40; }
-    else if (r < seuil) { pos.push('Revenus (' + r + '€) sous le plafond (' + Math.round(seuil) + '€)'); score += 25; }
-    else { neg.push('Revenus (' + r + '€) dépassent le plafond (' + Math.round(seuil) + '€)'); return ok(false, 10, pos, neg, 0); }
-    var montant = r < seuil * 0.4 ? 192 : 100;
-    return ok(true, Math.min(100, score), pos, neg, montant);
-  };
-
-  // ── Prime rénovation RBC
-  R.prime_renovation_rbc = function(p) {
-    if (p.region !== 'RBC') return ok(false, 0, [], ['Bruxelles uniquement'], 0);
-    if (p.logement !== 'proprietaire') return ok(false, 0, [], ['Réservé aux propriétaires bruxellois'], 0);
-    var r = rev(p), pos = [], neg = [];
-    pos.push('Propriétaire bruxellois — RENOLUTION applicable');
-    var score = 30;
-    if (r * 12 < 35285) { pos.push('Cat. 1 (< 35 285€/an) — remboursement 50-70%'); score += 50; }
-    else if (r * 12 < 60490) { pos.push('Cat. 2 — remboursement 30-50%'); score += 30; }
-    else { pos.push('Cat. 3 — remboursement 15-30%'); score += 15; }
-    return ok(true, Math.min(100, score), pos, neg, null);
-  };
-
-  // ── Logement social inscription
-  R.logement_social_inscription = function(p) {
-    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, [], ['RBC et Wallonie uniquement'], 0);
-    var r = rev(p), pos = [], neg = [];
-    var plafAnnuel = p.situation_familiale === 'seul' ? 23462 : 28154 + enfants(p) * 3385;
-    if (r * 12 < plafAnnuel) {
-      pos.push('Revenus (' + Math.round(r * 12) + '€/an) sous le plafond (' + Math.round(plafAnnuel) + '€/an)');
-      pos.push('Inscription immédiate recommandée — ouvre droit à l\'allocation loyer après 1 an');
-      return ok(true, 85, pos, neg, null, 'L\'inscription est gratuite et immédiate. Elle ouvre des droits importants dès 1 an sur liste.');
-    }
-    neg.push('Revenus (' + Math.round(r * 12) + '€/an) au-dessus du plafond d\'admission');
-    return ok(false, 10, pos, neg, null);
-  };
-
-  // ── Bourse d'études FWB
-  R.bourse_etudes_fwb = function(p) {
-    var a = age(p), r = rev(p), pos = [], neg = [];
-    if (!has(p, 'etudiant_superieur') && p.situation_pro !== 'etudiant') {
-      return ok(false, 0, pos, ['Réservé aux étudiants de l\'enseignement supérieur FWB'], 0);
-    }
-    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, pos, ['FWB — Bruxelles et Wallonie uniquement'], 0);
-    pos.push('Étudiant du supérieur en FWB — condition principale remplie');
-    var score = 40;
-    if (a > 35) { neg.push('Limite d\'âge généralement 35 ans sauf exceptions'); score -= 10; }
-    if (r < 900) { pos.push('Revenus propres faibles — bourse probable'); score += 35; }
-    else { pos.push('Revenus parentaux déterminants — à vérifier avec le simulateur FWB'); score += 15; }
-    neg.push('Le calcul final dépend des revenus de référence parentaux — simulateur sur allocations-etudes.cfwb.be');
-    return ok(true, Math.min(100, score), pos, neg, 200);
-  };
-
-  // ── Chèques formation
-  R.cheques_formation = function(p) {
-    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, [], ['Wallonie et Bruxelles uniquement'], 0);
-    var pos = [], neg = [];
-    if (p.situation_pro === 'sans_emploi' && p.region === 'RBC') {
-      pos.push('Formations gratuites via Bruxelles Formation pour chercheurs d\'emploi');
-      return ok(true, 85, pos, neg, null, 'À Bruxelles : formations gratuites langues, informatique, métiers via Bruxelles Formation après inscription ACTIRIS');
-    }
-    if (['employe','independant'].includes(p.situation_pro) && p.region === 'wallonie') {
-      pos.push('Salarié/indépendant wallon — chèques-formation disponibles (15€ le chèque de 30€)');
-      return ok(true, 85, pos, neg, null);
-    }
-    neg.push('Chèques-formation Wallonie : réservés aux salariés et indépendants');
-    return ok(false, 20, pos, neg, null);
-  };
-
-  // ── Aide matériel scolaire
-  R.aide_materiel_scolaire = function(p) {
-    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, [], ['RBC et Wallonie uniquement'], 0);
-    if (enfants(p) < 1) return ok(false, 0, [], ['Enfant(s) en âge scolaire requis'], 0);
-    var r = rev(p), pos = [], neg = [];
-    pos.push(enfants(p) + ' enfant(s) + région FWB — conditions de base remplies');
-    var score = 25;
-    if (r < 1200) { pos.push('Revenus faibles — aide scolaire prioritaire'); score += 50; }
-    else if (r < 2200) { pos.push('Revenus dans la fourchette éligible (< 2 200€/mois)'); score += 30; }
-    else { neg.push('Revenus (' + r + '€) possiblement au-dessus du seuil communal'); }
-    return ok(r < 2200, Math.min(100, score), pos, neg, null, 'Montants variables : 50-400€/enfant selon commune et CPAS. Demande en août.');
-  };
-
-  // ── Médiation dettes
-  R.mediation_dettes = function(p) {
-    if (!has(p, 'situation_dette')) return ok(false, 0, [], ['Réservé aux personnes en situation de surendettement'], 0);
-    var pos = [], neg = [];
-    pos.push('Situation d\'endettement déclarée — service GRATUIT disponible');
-    pos.push('Le médiateur stoppe les poursuites et négocie avec les créanciers');
-    var score = 80;
-    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Urgence financière — procédure prioritaire'); score = 95; }
-    pos.push('RCD (Règlement Collectif de Dettes) possible : plan sur 5 ans, remises partielles');
-    return ok(true, Math.min(100, score), pos, neg, null);
-  };
-
-  // ── Aide urgence CPAS
-  R.aide_urgence_cpas = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    var score = 20;
-    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Difficulté financière urgente déclarée — priorité CPAS 24-48h'); score += 60; }
-    if (r < 800) { pos.push('Revenus très faibles — aide CPAS urgente probable'); score += 30; }
-    else if (r < 1300) { pos.push('Revenus faibles — aide ponctuelle CPAS envisageable'); score += 15; }
-    pos.push('Le CPAS peut aider en nature : chèques alimentation, paiement facture, bon pharmacie');
-    return ok(has(p, 'difficulte_financiere_urgente') || r < 1300, Math.min(100, score), pos, neg,
-      r < 500 ? 600 : 300);
-  };
-
-  // ── Aide alimentaire
-  R.aide_alimentaire = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    var plaf = p.situation_familiale === 'seul' ? 1300 : 1700 + enfants(p) * 250;
-    var score = 0;
-    if (r < plaf * 0.6) { pos.push('Revenus très faibles — aide alimentaire prioritaire'); score += 70; }
-    else if (r < plaf) { pos.push('Revenus dans la fourchette éligible'); score += 40; }
-    else { neg.push('Revenus (' + r + '€) probablement au-dessus du seuil'); return ok(false, 10, pos, neg, 0); }
-    if (has(p, 'beneficiaire_ris') || has(p, 'difficulte_financiere_urgente')) {
-      pos.push('Bénéficiaire CPAS ou urgence — orientation directe vers épicerie sociale');
-      score += 20;
-    }
-    pos.push('Plus de 350 000 Belges utilisent ces services — aucune honte');
-    return ok(true, Math.min(100, score), pos, neg, 150);
-  };
-
-  // ── Aide migrants
-  R.aide_migrants = function(p) {
-    var pos = [], neg = [];
-    if (!['réfugié','demandeur_asile','sans papiers admis'].includes(p.nationalite) && !has(p, 'statut_migration')) {
-      return ok(false, 0, pos, ['Réservé aux personnes avec statut migratoire particulier'], 0);
-    }
-    var score = 60;
-    if (p.nationalite === 'demandeur_asile') {
-      pos.push('Demandeur d\'asile en procédure — prise en charge Fedasil : hébergement + allocation de poche');
-      pos.push('Allocation hebdomadaire selon phase : 7€ (phase 1) à 33€/semaine (phase autonomie)');
-      score = 90;
-    } else if (p.nationalite === 'réfugié') {
-      pos.push('Réfugié reconnu — droit au RIS via CPAS dès la sortie du centre Fedasil');
-      score = 85;
-    } else {
-      pos.push('Statut migratoire — contacter le CPAS pour évaluation des droits');
-      neg.push('Droits variables selon le titre de séjour exact');
-    }
-    return ok(true, Math.min(100, score), pos, neg, 600);
-  };
-
-  // ── Maximum à facturer
-  R.maximum_a_facturer = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    pos.push('Droit universel automatique — aucune démarche pour le MAF de base');
-    var seuil; var plafond;
-    if (r < S.maf_1) { seuil = '< 1 688€/mois'; plafond = '450€'; }
-    else if (r < S.maf_2) { seuil = '1 688-2 867€/mois'; plafond = '650€'; }
-    else if (r < S.maf_3) { seuil = '2 867-4 047€/mois'; plafond = '1 000€'; }
-    else { seuil = '> 4 047€/mois'; plafond = '1 800€'; }
-    pos.push('Plafond annuel frais médicaux : ' + plafond + ' (remboursement auto au-delà par mutualité)');
-    return ok(true, 90, pos, neg, null, 'Remboursement automatique en septembre par votre mutualité');
-  };
-
-  // ── Aide dentaire
-  R.aide_dentaire_cpas = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    if (r < 1200) { pos.push('Revenus faibles — accès soins dentaires sociaux probable'); return ok(true, 75, pos, neg, null); }
-    if (r < 1500) { pos.push('Revenus modestes — à vérifier selon CPAS local'); return ok(true, 50, pos, neg, null); }
-    neg.push('Revenus (' + r + '€) potentiellement au-dessus du seuil — vérifiez avec votre CPAS');
-    return ok(false, 20, pos, neg, null);
-  };
-
-  // ── Abonnement social transport
-  R.abonnement_social_transport = function(p) {
-    if (!['RBC','wallonie'].includes(p.region)) return ok(false, 0, [], ['STIB (BXL) et TEC (Wallonie) uniquement pour le tarif social'], 0);
-    var pos = [], neg = [];
-    var auto = isBenefActuel(p) || p.situation_pro === 'sans_emploi' || parseInt(p.age) >= 65;
-    var score = 20;
-    if (auto) { pos.push('Statut social confirmé — tarif social transport applicable'); score += 65; }
-    if (p.region === 'RBC') { pos.push('STIB social Bruxelles : 60€/an (= 5€/mois) au lieu de 499€ — économie 439€/an'); }
-    if (p.region === 'wallonie') { pos.push('TEC social Wallonie : 12€/mois au lieu de 52€ — économie 480€/an'); }
-    return ok(auto, Math.min(100, score), pos, neg, p.region === 'RBC' ? 37 : 40);
-  };
-
-  // ── Prime vélo RBC
-  R.prime_velo_rbc = function(p) {
-    if (p.region !== 'RBC') return ok(false, 0, [], ['Bruxelles uniquement'], 0);
-    var r = rev(p), pos = [], neg = [];
-    pos.push('Bruxelles — prime vélo accessible à tous les résidents');
-    var prime; var score = 60;
-    if (r * 12 < 35285) { prime = '400€ (électrique) / 50€ (classique)'; score = 80; }
-    else if (r * 12 < 60490) { prime = '200€ (électrique) / 20€ (classique)'; score = 70; }
-    else { prime = '200€ (électrique) / 20€ (classique) — cat. 3'; score = 60; }
-    pos.push('Montant : ' + prime);
-    return ok(true, Math.min(100, score), pos, neg, null);
-  };
-
-  // ── Tarif télécom social
-  R.tarif_telecom_social = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    var auto = isBenefActuel(p) || has(p, 'beneficiaire_ris') || parseInt(p.age) >= 65;
-    var score = 10;
-    if (auto) { pos.push('Statut social — tarif télécom social applicable sur présentation attestation'); score += 65; }
-    if (r < 1200) { pos.push('Revenus faibles — très probablement éligible'); score += 40; }
-    else if (r < S.telecom_revenu_max) { pos.push('Revenus sous le seuil télécom social (1 800€/mois)'); score += 25; }
-    else { neg.push('Revenus (' + r + '€) probablement au-dessus du seuil (1 800€/mois)'); }
-    pos.push('Économie : jusqu\'à 40€/mois sur internet + téléphone fixe');
-    return ok(auto || r < S.telecom_revenu_max, Math.min(100, score), pos, neg, 28);
-  };
-
-  // ── Aide juridique
-  R.aide_juridique = function(p) {
-    var r = rev(p), pos = [], neg = [];
-    var score = 20;
-    if (r < S.aide_juridique_gratuit || isBenefActuel(p) || has(p, 'beneficiaire_ris')) {
-      pos.push('Avocat PRO DEO entièrement GRATUIT — revenus sous le seuil ou statut social');
-      score = 85;
-    } else if (r < S.aide_juridique_partiel) {
-      pos.push('Aide juridique partiellement gratuite (contribution réduite 30-125€)');
-      score = 65;
-    } else {
-      neg.push('Revenus (' + r + '€) au-dessus du seuil de gratuité — aide partielle possible');
-      score = 30;
-    }
-    if (has(p, 'situation_dette')) { pos.push('Médiation de dettes + aide juridique : combo recommandé'); score += 5; }
-    if (has(p, 'difficulte_financiere_urgente')) { pos.push('Urgence juridique possible (expulsion, saisie) — BAJ prioritaire'); score += 5; }
-    return ok(r < S.aide_juridique_partiel || isBenefActuel(p), Math.min(100, score), pos, neg, null);
-  };
-
-  // ── Accompagnement CPAS
-  R.cpas_accompagnement = function(p) {
-    var pos = [];
-    pos.push('Accessible à toute personne en difficulté — aucune condition de revenus requise');
-    pos.push('Aide administrative, orientation, médiation propriétaire/créanciers');
-    return ok(true, 80, pos, [], null, 'Le CPAS accompagne même sans aide financière. Premier RDV libre.');
-  };
-
-  // ── Aide ménagère
-  R.aide_menagere = function(p) {
-    var a = age(p), pos = [], neg = [];
-    if (a < 60 && !has(p, 'handicap') && !has(p, 'maladie_chronique') && p.situation_pro !== 'incapacite') {
-      return ok(false, 0, pos, ['Réservé aux 60+ ou personnes avec perte d\'autonomie'], 0);
-    }
-    if (a >= 60) pos.push('60 ans et plus — aide ménagère CPAS accessible');
-    if (has(p, 'handicap') || has(p, 'maladie_chronique')) pos.push('Perte d\'autonomie — accès quel que soit l\'âge');
-    var r = rev(p);
-    var tarif = r < 1000 ? '4-6€/h' : r < 1500 ? '8-12€/h' : '15-25€/h';
-    pos.push('Tarif horaire selon revenus : ' + tarif);
-    return ok(true, 75, pos, neg, null);
-  };
-
-  // ── Réduction impôt pension
-  R.reduction_impot_pension = function(p) {
-    var pos = [], neg = [];
-    var aides_rev_remp = ['sans_emploi','incapacite','pension'].includes(p.situation_pro);
-    if (!aides_rev_remp && !has(p, 'beneficiaire_ris')) {
-      return ok(false, 0, pos, ['S\'applique aux bénéficiaires de revenus de remplacement'], 0);
-    }
-    pos.push('Revenus de remplacement (chômage, pension, incapacité, RIS) → réduction d\'impôt automatique');
-    pos.push('À déclarer correctement dans la déclaration fiscale annuelle');
-    if (parseInt(p.age) >= 65) { pos.push('65+ : pension minimum souvent exonérée d\'impôt sous certains seuils'); }
-    return ok(true, 70, pos, neg, null, 'Automatique lors de la déclaration fiscale. Vérifiez votre précompte en cours d\'année.');
-  };
-
-  /* ────────────────────────────────────────────────────────────────
-     GÉNÉRATION DE L'ANALYSE TEXTUELLE PERSONNALISÉE
-  ──────────────────────────────────────────────────────────────── */
-  function genererAnalyse(profil, aides) {
-    var r = rev(profil);
-    var a = age(profil);
-    var nb = enfants(profil);
-    var region = { RBC: 'Région de Bruxelles-Capitale', wallonie: 'Wallonie', flandre: 'Flandre' }[profil.region] || profil.region;
-    var sitFam = { seul: 'célibataire', marie: 'en couple', cohabitant: 'cohabitant·e', monoparental: 'parent isolé·e' }[profil.situation_familiale] || profil.situation_familiale;
-    var sitPro = { employe: 'en emploi', sans_emploi: 'sans emploi', independant: 'indépendant·e', etudiant: 'étudiant·e', pension: 'pensionné·e', incapacite: 'en incapacité de travail', autre: 'dans une situation particulière' }[profil.situation_pro] || profil.situation_pro;
-
-    var urgentes = aides.filter(function(a) { return a.urgence; });
-    var montant  = aides.reduce(function(s, aide) {
-      var m = (aide._montant_estime !== undefined && aide._montant_estime !== null) ? aide._montant_estime : (aide.montant_mensuel_max || 0);
-      return s + m;
-    }, 0);
-
-    // Para 1 : portrait de situation
-    var para1 = (profil.prenom || 'Votre profil') + ' est ' + sitFam + ', âgé·e de ' + a + ' ans, ' + sitPro + ', et réside en ' + region + '. ';
-    if (r === 0) {
-      para1 += 'Sans revenu déclaré, vous êtes dans une situation de précarité sévère qui nécessite une intervention rapide du CPAS. ';
-    } else if (r < 700) {
-      para1 += 'Avec ' + r + '€ de revenus nets par mois, votre situation est critique et vous ouvre droit à l\'ensemble des aides de base. ';
-    } else if (r < 1200) {
-      para1 += 'Avec ' + Math.round(r) + '€ de revenus nets par mois, votre situation est précaire et vous avez droit à de nombreuses aides cumulables. ';
-    } else if (r < 1800) {
-      para1 += 'Avec ' + Math.round(r) + '€ de revenus nets par mois, votre situation est modeste et plusieurs aides ciblées s\'appliquent à votre profil. ';
-    } else {
-      para1 += 'Avec ' + Math.round(r) + '€ de revenus nets par mois, certaines aides restent accessibles selon votre composition de ménage. ';
-    }
-    if (nb > 0) {
-      para1 += 'La présence de ' + nb + ' enfant(s) à charge élargit plusieurs seuils d\'éligibilité et ouvre des droits supplémentaires (allocations familiales, suppléments sociaux, aide scolaire). ';
-    }
-    if (has(profil, 'handicap') || has(profil, 'maladie_chronique')) {
-      para1 += 'Votre situation de handicap ou maladie chronique ouvre des droits spécifiques importants à travers le SPF Sécurité Sociale. ';
-    }
-
-    // Para 2 : droits identifiés
-    var top5 = aides.slice(0, 5).map(function(a) { return a.nom; }).join(', ');
-    var para2 = 'Nous avons identifié ' + aides.length + ' aide(s) pour lesquelles vous présentez une éligibilité potentielle, pour un potentiel mensuel estimé à ' + montant.toLocaleString('fr-BE') + '€. ';
-    if (aides.length > 0) {
-      para2 += 'Les principales sont : ' + top5 + '. Ces aides sont cumulables entre elles dans la plupart des cas — c\'est précisément ce que beaucoup de bénéficiaires ignorent. ';
-    }
-    if (has(profil, 'situation_dette')) {
-      para2 += 'La médiation de dettes gratuite via le CPAS peut vous permettre de restructurer vos dettes et stopper les poursuites — ne négligez pas cette démarche. ';
-    }
-    if (profil.situation_pro === 'sans_emploi') {
-      para2 += 'En tant que chercheur·euse d\'emploi, des formations gratuites et des primes à l\'embauche (Activa/Win-Win) peuvent faciliter votre retour à l\'emploi. ';
-    }
-
-    // Para 3 : démarches concrètes
-    var para3 = 'Prochaine étape concrète : ';
-    if (urgentes.length > 0) {
-      para3 += 'Contactez en priorité votre CPAS à ' + (profil.commune || 'votre commune') + ' — ' + urgentes.length + ' aide(s) urgente(s) peuvent être accordées sous 24 à 48 heures. ';
-    } else {
-      para3 += 'Prenez rendez-vous avec votre CPAS pour un bilan social complet — le CPAS peut initier plusieurs demandes simultanément. ';
-    }
-    if (profil.region === 'RBC') {
-      para3 += 'Pour les aides régionales bruxelloises : Iriscare (allocations familiales), logement.brussels (allocation loyer), Bruxelles Environnement (RENOLUTION). ';
-    } else if (profil.region === 'wallonie') {
-      para3 += 'Pour les aides wallonnes : appelez le 1718 (gratuit, SPW Énergie/Logement) et le 081 25 25 25 (Famiwal). ';
-    }
-    para3 += 'Ce dossier est indicatif basé sur votre profil déclaratif. L\'éligibilité définitive est confirmée par chaque organisme lors de votre demande.';
-
-    return para1.trim() + '\n\n' + para2.trim() + '\n\n' + para3.trim();
-  }
-
-  /* ────────────────────────────────────────────────────────────────
-     POINT D'ENTRÉE PRINCIPAL
-  ──────────────────────────────────────────────────────────────── */
-  window.analyserProfil = function(profil) {
-    var resultats = [];
-    var details   = {};
-
-    for (var i = 0; i < window.AIDES_DB.length; i++) {
-      var aide = window.AIDES_DB[i];
-      var regle = R[aide.id];
-      var evaluation;
-
-      if (regle) {
-        evaluation = regle(profil);
-      } else {
-        // Règle générique pour les aides sans règle spécifique
-        var c = aide.conditions || {};
-        var region = profil.region;
-        var r2 = rev(profil);
-        var a2 = age(profil);
-        var eligible = true;
-        if (c.residences && c.residences.indexOf(region) === -1) eligible = false;
-        if (c.age_min && a2 < c.age_min) eligible = false;
-        if (c.age_max && a2 > c.age_max) eligible = false;
-        if (c.revenu_max_mensuel && r2 > c.revenu_max_mensuel * 1.1) eligible = false;
-        evaluation = ok(eligible, eligible ? 50 : 0, [], [], null);
-      }
-
-      details[aide.id] = evaluation;
-
-      if (evaluation.eligible && evaluation.score >= 15) {
-        resultats.push({ aide: aide, score: evaluation.score, evaluation: evaluation });
-      }
-    }
-
-    // Tri : urgences en tête, puis score décroissant
-    resultats.sort(function(a, b) {
-      var urgA = a.aide.urgence ? 1 : 0;
-      var urgB = b.aide.urgence ? 1 : 0;
-      if (urgA !== urgB) return urgB - urgA;
-      return b.score - a.score;
-    });
-
-    var aidesFinales = resultats.map(function(r) {
-      var aide = Object.assign({}, r.aide);
-      if (r.evaluation.montant_estime !== null && r.evaluation.montant_estime !== undefined) {
-        aide._montant_estime = r.evaluation.montant_estime;
-      }
-      aide._score      = r.score;
-      aide._motifs_pos = r.evaluation.motifs_positifs;
-      aide._motifs_neg = r.evaluation.motifs_negatifs;
-      aide._note       = r.evaluation.note_specifique;
-      return aide;
-    });
-
-    var analyse = genererAnalyse(profil, aidesFinales);
-    return { aides: aidesFinales, analyse: analyse, details: details };
-  };
-
-  // Rétrocompatibilité
-  window.preselectAides = function(profil) {
-    return window.analyserProfil(profil).aides;
-  };
-
-})();
 
 </script>
 </body>
