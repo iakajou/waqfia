@@ -1259,22 +1259,22 @@ function animateLoading(){
 }
 
 function showScreen(name){
+  var map={
+    'form':    ['form-section','block'],
+    'loading': ['screen-loading','block'],
+    'results': ['screen-results','block']
+  };
+  // Cacher tout
   ['form-section','screen-loading','screen-results'].forEach(function(id){
-    var el=$id(id);if(!el)return;
-    el.style.display=id.includes(name)||id===name?'':'none';
+    var el=$id(id);if(el)el.style.display='none';
   });
-  if(name==='loading'){
-    $id('form-section').style.display='none';
-    $id('screen-loading').style.display='block';
-    $id('screen-results').style.display='none';
+  // Montrer le bon écran
+  if(name==='form'){
+    var el=$id('form-section');if(el)el.style.display='block';
+  } else if(name==='loading'){
+    var el=$id('screen-loading');if(el)el.style.display='block';
   } else if(name==='results'){
-    $id('form-section').style.display='none';
-    $id('screen-loading').style.display='none';
-    $id('screen-results').style.display='block';
-  } else {
-    $id('form-section').style.display='block';
-    $id('screen-loading').style.display='none';
-    $id('screen-results').style.display='none';
+    var el=$id('screen-results');if(el)el.style.display='block';
   }
   window.scrollTo({top:0,behavior:'smooth'});
 }
@@ -1638,8 +1638,11 @@ function renderAidePDF(a,idx,urgMode){
 doc.save('dossier-aides-'+(P.prenom||'waqfia')+'-2026.pdf');
 };
 
+
 </script>
 
+<script>
+/* === AIDES DATABASE === */
 /**
  * AIDES_V2.JS — Base de données complète des aides sociales belges
  * Version 2 — 55+ aides, montants différenciés par statut, conditions précises
@@ -2948,6 +2951,8 @@ window.preselectAides = function(profil) {
   });
 };
 
+
+/* === MOTEUR REGLES === */
 /**
  * MOTEUR_V2.JS — Moteur de règles précis pour Waqf IA
  * Correspond à aides_v2.js — 55 aides, seuils légaux 2024-2025
@@ -3830,4 +3835,6 @@ window.preselectAides = function(profil) {
 
 })();
 
-</body></html>
+</script>
+</body>
+</html>
